@@ -1,0 +1,543 @@
+import time
+import math
+import enum
+import sys
+import logging
+import numpy as np
+import serial  # Added import for serial communication
+from simple_pid import PID  # Added import for simple-pid
+from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
+from unitree_sdk2py.go2.sport.sport_client import SportClient
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+from pitch import PitchController
+
+# 配置日志（输出到终端和文件）
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('/home/unitree/robot_controller.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# 模拟目标列表（全局坐标）
+target_list = [
+    {"name": "shirt", "coord": [-0.6, 0]},
+    {"name": "person", "coord": [-1.2, 0]}
+]
+
+
+# 状态定义
+class State(enum.Enum):
+    IDLE = 0
+    NAVIGATE_TO_OBJECT = 1
+    LOWER_HEAD = 2
+    GRASP_OBJECT = 3
+    SEND_NEXT_COMMAND = 4
+    NAVIGATE_TO_PERSON = 5
+    RELEASE_OBJECT = 6
+    DONE = 7
+    WAIT = 8  # 新增空闲状态
+
+
+# 机器人状态（全局变量，初始为 None）
+robot_state = None
+
+
+def HighStateHandler(msg: SportModeState_):
+    global robot_state
+    robot_state = msg
+
+
+# Helper function to send hex data to serial port
+def send_hex_to_serial(hex_data, port='/dev/wheeltec_mic', baudrate=115200):
+    logger = logging.getLogger(__name__)
+    try:
+        # Configure serial port
+        ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            timeout=1
+        )
+
+        # Ensure serial port is open
+        if ser.is_open:
+            logger.info(f"Connected to {ser.name}")
+
+            # Send hex data
+            ser.write(hex_data)
+            logger.info(f"Sent hex data: {hex_data.hex(' ')}")
+
+            # Wait for a moment to ensure data is sent
+            time.sleep(0.1)
+
+        # Close serial port
+        ser.close()
+        return True
+    except serial.SerialException as e:
+        logger.error(f"Serial port error: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error sending hex data: {e}")
+        return False
+
+
+def transform_global_xy_to_robot_xy(global_xy, robot_xy, yaw):
+    robot_x = robot_xy[0]
+    robot_y = robot_xy[1]
+    global_x = global_xy[0]
+    global_y = global_xy[1]
+    target_from_go1_xyz = [global_x - robot_x, global_y - robot_y]
+    global_x_in_robot = target_from_go1_xyz[0] * np.cos(yaw) + target_from_go1_xyz[1] * np.sin(yaw)
+    global_y_in_robot = - target_from_go1_xyz[0] * np.sin(yaw) + target_from_go1_xyz[1] * np.cos(yaw)
+    return np.array([global_x_in_robot, global_y_in_robot])
+
+
+class RobotController:
+    CLAW_OFFSET_FORWARD = 0.2  # Placeholder: distance from robot center to claw tip along robot's forward axis (meters). PLEASE MEASURE AND ADJUST.
+
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.logger.info("初始化 RobotController")
+
+        # 初始化 SportClient
+        try:
+            self.sport_client = SportClient()
+            self.sport_client.Init()
+            self.logger.info("SportClient 初始化成功")
+        except Exception as e:
+            self.logger.error(f"SportClient 初始化失败: {e}")
+            raise RuntimeError(f"SportClient 初始化失败: {e}")
+
+        # 初始化状态订阅
+        try:
+            self.sub = ChannelSubscriber("rt/sportmodestate", SportModeState_)
+            self.sub.Init(HighStateHandler, 20)
+            time.sleep(2)
+            if robot_state is None:
+                self.logger.error("未能接收到机器人状态")
+                raise RuntimeError("状态订阅失败：无数据")
+            self.logger.info("状态订阅初始化成功")
+        except Exception as e:
+            self.logger.error(f"状态订阅初始化失败: {e}")
+            raise RuntimeError(f"状态订阅初始化失败: {e}")
+
+        self.state = State.IDLE
+        self.target_index = 0
+        self.current_coord = [0.0, 0.0]
+
+        # PID 控制器（优化参数） using simple-pid
+        self.yaw_pid = PID(Kp=0.5, Ki=0.02, Kd=0.3, output_limits=(-0.6, 0.6))  # For larger initial turns (Phase 1)
+        self.yaw_pid_fine_tune = PID(Kp=0.25, Ki=0.01, Kd=0.15,
+                                     output_limits=(-0.3, 0.3))  # For gentle adjustments (Phase 2)
+        # Setpoint for yaw_pid(s) will be set dynamically before use.
+
+        self.dist_pid = PID(Kp=0.25, Ki=0.0, Kd=0.25, setpoint=0, output_limits=(0.0, 0.15))
+        # For dist_pid, setpoint is 0 (target distance is 0). Input will be -distance.
+
+        # 初始化 PitchController
+        self.pitch_controller = PitchController(self.sport_client, interpolation_duration_s=2.0)
+        self.logger.info("PitchController initialized.")
+        # 关键点：启动 PitchController 的后台线程
+        try:
+            self.pitch_controller.start_control()
+            self.logger.info("PitchController control started.")
+        except Exception as e:
+            self.logger.error(f"Failed to start PitchController: {e}")
+            # 根据您的错误处理策略，这里可能需要 raise e 或者采取其他措施
+
+    def convert_relative_to_global(self, relative_coord_robot_frame):
+        """Converts coordinates relative to the robot's current position AND ORIENTATION to global coordinates.
+        relative_coord_robot_frame[0] is distance forward along robot's current heading.
+        relative_coord_robot_frame[1] is distance to the left of the robot's current heading.
+        """
+        if robot_state is None:
+            self.logger.error("Robot state not available for coordinate conversion.")
+            raise RuntimeError("Robot state not available for coordinate conversion.")
+
+        current_robot_px = robot_state.position[0]
+        current_robot_py = robot_state.position[1]
+        current_robot_yaw = robot_state.imu_state.rpy[2]  # Yaw in radians
+
+        relative_forward = relative_coord_robot_frame[0]
+        relative_left = relative_coord_robot_frame[1]
+
+        # Rotate the relative coordinates to align with the global frame
+        offset_x_global = relative_forward * math.cos(current_robot_yaw) - relative_left * math.sin(current_robot_yaw)
+        offset_y_global = relative_forward * math.sin(current_robot_yaw) + relative_left * math.cos(current_robot_yaw)
+
+        # Add the global offset to the robot's current global position
+        global_x = current_robot_px + offset_x_global
+        global_y = current_robot_py + offset_y_global
+
+        self.logger.info(
+            f"Coordinate conversion (robot-oriented): Robot at [{current_robot_px:.2f}, {current_robot_py:.2f}, yaw:{current_robot_yaw:.2f}rad]. Relative (Fwd,Left) {relative_coord_robot_frame} -> Global Offset [{offset_x_global:.2f}, {offset_y_global:.2f}] -> Global Goal [{global_x:.2f}, {global_y:.2f}]")
+        return [global_x, global_y]
+
+    def try_move(self, vx, vy, vyaw, identifier: int):
+        print(f"Calling Move - ID: {identifier}, vx: {vx}, vy: {vy}, vyaw: {vyaw}")
+        self.sport_client.Move(vx, vy, vyaw)
+
+    def stop_moving(self, identifier: int = 6):
+        """Stops the robot's movement using try_move."""
+        self.logger.info(f"Issuing stop command via try_move with ID: {identifier}")
+        self.sport_client.StopMove()
+
+    def normalize_angle(self, angle):
+        """将角度归一化到 [-π, π]"""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    def _phase1_rotate_to_target(self, global_goal, initial_yaw, yaw_tolerance, max_rot_time, control_period):
+        """第一阶段：只旋转朝向目标"""
+        self.logger.info(f"导航阶段1: 开始旋转朝向目标 {global_goal}")
+        if robot_state is None:
+            raise RuntimeError("机器人状态不可用 (阶段1)")
+        px = robot_state.position[0]
+        py = robot_state.position[1]
+
+        goal_body = transform_global_xy_to_robot_xy(global_goal, [px, py],
+                                                    initial_yaw)  # Use initial_yaw for consistent target angle
+        robot_x, robot_y = goal_body[0], goal_body[1]
+        theta = math.atan2(robot_y, robot_x)  # Angle in robot's initial frame to the target
+
+        # Target yaw is the robot's initial yaw + the angle to the target in the robot's frame
+        target_yaw = self.normalize_angle(initial_yaw + theta)
+        self.logger.info(
+            f"阶段1 - 当前Yaw: {initial_yaw:.2f}, 目标点相对角度: {theta:.2f}, 计算目标全局Yaw: {target_yaw:.2f} rad")
+
+        start_time = time.time()
+        while time.time() - start_time < max_rot_time:
+            if robot_state is None:
+                raise RuntimeError("机器人状态不可用 (阶段1 循环中)")
+            current_yaw = robot_state.imu_state.rpy[2]
+            yaw_error = self.normalize_angle(target_yaw - current_yaw)
+
+            if abs(yaw_error) < yaw_tolerance:
+                self.logger.info("阶段1: 旋转完成")
+                self.sport_client.StopMove()  # Stop rotation before proceeding
+                return True
+
+            self.yaw_pid.setpoint = target_yaw
+            vyaw = self.yaw_pid(current_yaw)  # simple-pid computes output based on (setpoint - input)
+
+            self.logger.debug(
+                f"阶段1 - 当前Yaw: {current_yaw:.2f}, 目标Yaw: {target_yaw:.2f}, 误差: {yaw_error:.2f}, vyaw: {vyaw:.2f}")
+            self.try_move(0.0, 0.0, vyaw, 11)  # ID 11 for phase 1 rotation
+            time.sleep(control_period)
+
+        self.logger.error("阶段1: 旋转超时")
+        self.sport_client.StopMove()
+        raise RuntimeError("旋转未完成 (阶段1超时)")
+
+    def _phase2_move_and_adjust_to_target(self, global_goal, dist_tolerance, yaw_tolerance, max_nav_time,
+                                          control_period):
+        """第二阶段：边旋转边前进到目标"""
+        self.logger.info(f"导航阶段2: 开始前进并调整朝向目标 {global_goal}")
+        start_time = time.time()
+        while time.time() - start_time < max_nav_time:
+            if robot_state is None:
+                raise RuntimeError("机器人状态不可用 (阶段2)")
+            px = robot_state.position[0]
+            py = robot_state.position[1]
+            current_yaw = robot_state.imu_state.rpy[2]
+
+            goal_body = transform_global_xy_to_robot_xy(global_goal, [px, py], current_yaw)
+            robot_x, robot_y = goal_body[0], goal_body[1]
+            distance = math.sqrt(robot_x ** 2 + robot_y ** 2)
+
+            if distance < dist_tolerance:
+                self.logger.info("阶段2: 前进完成 (已达目标点)")
+                self.sport_client.StopMove()  # Stop movement
+                return True
+
+            # Theta is the angle to the target in the current robot's body frame.
+            # We want to drive this angle to 0.
+            theta_to_target_in_body = math.atan2(robot_y, robot_x)
+
+            # PID for yaw: setpoint is 0 for theta_to_target_in_body.
+            # The PID input is theta_to_target_in_body.
+            # If theta_to_target_in_body is positive (target to the left), we need positive vyaw.
+            # simple-pid output = Kp*(setpoint - input) + ... = Kp*(0 - theta_to_target_in_body)
+            # So, to get corrective vyaw, we need vyaw = -pid_output if pid input is theta.
+            self.yaw_pid_fine_tune.setpoint = 0
+            vyaw_from_pid = self.yaw_pid_fine_tune(theta_to_target_in_body)  # Use fine-tune PID
+            vyaw = -vyaw_from_pid if abs(theta_to_target_in_body) > yaw_tolerance else 0.0
+
+            # PID for distance: setpoint is 0. Input is current distance.
+            # We want to reduce distance, so vx should be positive.
+            # simple-pid output = Kp*(setpoint - input) + ... = Kp*(0 - distance) = -Kp*distance
+            # So, to get positive vx, we need vx = -pid_output if pid input is distance.
+            # Or, pid_input = -distance, then vx = pid_output.
+            self.dist_pid.setpoint = 0
+            vx = self.dist_pid(-distance)  # Input -distance to get positive output for forward motion
+
+            # Limit speed, especially when close, to prevent overshoot
+            # This is a simple proportional scaling based on distance, could be more sophisticated
+            vx = min(vx, 0.05 + 0.1 * (distance / (dist_tolerance * 5)))  # Slower when closer
+            vx = max(0.01, vx)  # Ensure some minimal movement if not at target
+
+            self.logger.debug(
+                f"阶段2 - 距离: {distance:.2f}m, 目标角度(体): {theta_to_target_in_body:.2f}rad, vx: {vx:.3f}, vyaw: {vyaw:.3f}")
+            self.try_move(vx, 0.0, vyaw, 12)  # ID 12 for phase 2 navigation
+            time.sleep(control_period)
+
+        self.logger.error("阶段2: 前进超时")
+        self.sport_client.StopMove()
+        raise RuntimeError("前进未完成 (阶段2超时)")
+
+    def navigate_to(self, global_goal):
+        """导航到全局坐标目标点 [x, y]"""
+        if robot_state is None:
+            self.logger.error("Cannot record initial state: Robot state unavailable at start of navigate_to.")
+            initial_robot_px, initial_robot_py, initial_robot_yaw = 0.0, 0.0, 0.0
+            self.logger.warning("Robot state was None. Using (0,0,0) as initial state, which might be incorrect.")
+        else:
+            initial_robot_px = robot_state.position[0]
+            initial_robot_py = robot_state.position[1]
+            initial_robot_yaw = robot_state.imu_state.rpy[2]
+
+        self.logger.info(
+            f"Navigate_to started. From: Global [{initial_robot_px:.2f}, {initial_robot_py:.2f}, Yaw:{initial_robot_yaw:.2f}rad] To: Global {global_goal}")
+
+        control_period = 0.02
+        yaw_tolerance = 0.015  # Increased slightly for smoother transition
+        dist_tolerance = 0.08  # Reduced slightly for better accuracy
+        max_rot_time = 15.0  # Max time for initial rotation
+        max_nav_time = 90.0  # Max time for moving to target
+
+        try:
+            # Reset PIDs before starting a new navigation sequence
+            self.yaw_pid.reset()
+            self.yaw_pid_fine_tune.reset()  # Reset the fine-tune PID as well
+            self.dist_pid.reset()
+
+            # 第一阶段：只旋转
+            self.logger.info("调用导航阶段1: 旋转...")
+            self._phase1_rotate_to_target(global_goal, initial_robot_yaw, yaw_tolerance, max_rot_time, control_period)
+            self.logger.info("导航阶段1完成.")
+
+            # Wait a bit after rotation before moving
+            time.sleep(0.5)
+
+            # 第二阶段：边旋转边前进
+            self.logger.info("调用导航阶段2: 前进和调整...")
+            self._phase2_move_and_adjust_to_target(global_goal, dist_tolerance, yaw_tolerance, max_nav_time,
+                                                   control_period)
+            self.logger.info("导航阶段2完成.")
+
+            # Ensure robot is stopped at the end of navigation
+            self.sport_client.StopMove()
+            self.logger.info("导航成功完成，机器人已停止。")
+
+            # Update current coordinate based on the goal, assuming success
+            self.current_coord = global_goal
+            # For more accuracy, could use robot_state.position here, but goal is what we aimed for.
+            # If robot_state is available:
+            # if robot_state:
+            #    self.current_coord = [robot_state.position[0], robot_state.position[1]]
+            #    self.logger.info(f"实际到达位置: ({self.current_coord[0]:.2f}, {self.current_coord[1]:.2f})")
+            # else:
+            #    self.logger.warning("Robot state not available to confirm final position, assuming goal was reached.")
+            self.logger.info(f"已到达全局目标 (或导航序列结束) {self.current_coord}")
+
+            achieved_delta_x_global = self.current_coord[0] - initial_robot_px
+            achieved_delta_y_global = self.current_coord[1] - initial_robot_py
+            achieved_relative_forward = achieved_delta_x_global * math.cos(initial_robot_yaw) + \
+                                        achieved_delta_y_global * math.sin(initial_robot_yaw)
+            achieved_relative_left = -achieved_delta_x_global * math.sin(initial_robot_yaw) + \
+                                     achieved_delta_y_global * math.cos(initial_robot_yaw)
+            self.logger.info(
+                f"相对于导航出发点的移动: 前进 {achieved_relative_forward:.2f} 米, 向左 {achieved_relative_left:.2f} 米.")
+
+        except RuntimeError as e:  # Catch specific RuntimeErrors from phases
+            self.logger.error(f"导航失败 (RuntimeError): {e}")
+            self.sport_client.StopMove()  # Ensure robot is stopped on failure
+            raise  # Re-raise the exception to be caught by the main loop if necessary
+        except Exception as e:
+            self.logger.error(f"导航中发生未知错误: {e}")
+            self.sport_client.StopMove()  # Ensure robot is stopped
+            raise RuntimeError(f"导航中发生未知错误: {e}")
+
+    def lower_head(self, desired_pitch_angle: float = 20.0):
+        self.logger.info(f"降低头部，目标俯仰角: {desired_pitch_angle}°")
+
+        if self.pitch_controller:
+            self.pitch_controller.set_pitch(desired_pitch_angle)
+        else:
+            self.logger.warning("PitchController 未在状态机中初始化，无法调整头部俯仰角。")
+
+    def grasp(self):
+        self.logger.info("Grabbing object by sending hex command...")
+        # Hex data for grasping (assuming data1 from claw.py is for grasping)
+        grasp_data = bytes([0x7b, 0x01, 0x02, 0x01, 0x20, 0x49, 0x20, 0x00, 0xc8, 0xf8, 0x7d])
+        success = send_hex_to_serial(grasp_data)
+        if success:
+            self.logger.info("Grasp command sent successfully.")
+        else:
+            self.logger.error("Failed to send grasp command.")
+        time.sleep(1.5)  # Adding a delay to allow physical grasping
+        return success
+
+    def release(self):
+        self.logger.info("Releasing object by sending hex command...")
+        # Hex data for releasing (assuming data2 from claw.py is for releasing)
+        # Using the actual data2 variable content: bytes([0x7b, 0x01, 0x02, 0x00, 0x20, 0x49, 0x20, 0x00, 0xc8, 0xf9, 0x7d])
+        release_data = bytes([0x7b, 0x01, 0x02, 0x00, 0x20, 0x49, 0x20, 0x00, 0xc8, 0xf9, 0x7d])
+        success = send_hex_to_serial(release_data)
+        if success:
+            self.logger.info("Release command sent successfully.")
+        else:
+            self.logger.error("Failed to send release command.")
+        time.sleep(1.0)  # Adding a delay to allow physical releasing
+        # No return value needed for release as per original, but good practice to return success
+        return success
+
+    def send_next_to_vlm(self):
+        self.logger.info("向 VLM 发送 'next' (模拟)")
+        time.sleep(0.3)
+
+    def get_next_target_from_vlm(self):
+        self.logger.info("获取下一个目标坐标")
+        time.sleep(0.3)
+        return target_list[1]["coord"]
+
+    def run(self):
+        self.state = State.NAVIGATE_TO_OBJECT
+        while self.state != State.DONE:
+            try:
+                if self.state == State.WAIT:
+                    # self.stop_moving()
+                    # ret1 = self.sport_client.SwitchGait(0)
+                    ret2 = self.sport_client.StopMove()
+                    self.logger.info("进入空闲状态，什么都不做。")
+                    time.sleep(1)
+                    # 空闲后自动进入下一个状态
+                    if hasattr(self, '_next_state') and self._next_state is not None:
+                        self.state = self._next_state
+                        self._next_state = None
+                    continue
+                if self.state == State.NAVIGATE_TO_OBJECT:
+                    if robot_state is None:
+                        self.logger.error("Robot state not available for offset navigation goal calculation. Waiting.")
+                        time.sleep(1)  # Wait for robot state to become available
+                        continue  # Re-evaluate state in next loop iteration
+
+                    object_relative_coord = target_list[0]["coord"]
+                    # This is the global coordinate of the OBJECT
+                    object_global_coord = self.convert_relative_to_global(object_relative_coord)
+                    self.logger.info(f"Object's actual global coordinate: {object_global_coord}")
+
+                    # Calculate the vector from robot's current position to the object's global position
+                    current_robot_px = robot_state.position[0]
+                    current_robot_py = robot_state.position[1]
+
+                    delta_x_to_object = object_global_coord[0] - current_robot_px
+                    delta_y_to_object = object_global_coord[1] - current_robot_py
+
+                    # Calculate the angle of this vector (this is the direction robot should approach from)
+                    # This approach_yaw is a global angle
+                    approach_yaw = math.atan2(delta_y_to_object, delta_x_to_object)
+
+                    # Calculate the adjusted global target for the ROBOT'S CENTER
+                    # The robot's center should be CLAW_OFFSET_FORWARD distance *behind* the object along the approach_yaw
+                    robot_center_target_x = object_global_coord[0] - self.CLAW_OFFSET_FORWARD * math.cos(approach_yaw)
+                    robot_center_target_y = object_global_coord[1] - self.CLAW_OFFSET_FORWARD * math.sin(approach_yaw)
+
+                    adjusted_global_nav_goal_for_robot_center = [robot_center_target_x, robot_center_target_y]
+
+                    self.logger.info(
+                        f"NAVIGATE_TO_OBJECT: Original object global: [{object_global_coord[0]:.2f}, {object_global_coord[1]:.2f}]. "
+                        f"Approach Yaw: {approach_yaw:.2f} rad. "
+                        f"Claw offset: {self.CLAW_OFFSET_FORWARD}m. "
+                        f"Adjusted robot center target: [{adjusted_global_nav_goal_for_robot_center[0]:.2f}, {adjusted_global_nav_goal_for_robot_center[1]:.2f}]")
+
+                    self.navigate_to(adjusted_global_nav_goal_for_robot_center)
+                    self._next_state = State.LOWER_HEAD
+                    self.state = State.WAIT
+                elif self.state == State.LOWER_HEAD:
+                    self.lower_head()
+                    interpolation_duration = self.pitch_controller._shared_state.get('interpolation_duration_s', 2.0)
+                    self.logger.info(f"等待 {interpolation_duration:.1f}s 以完成头部俯仰角调整...")
+                    self._next_state = State.GRASP_OBJECT
+                    self.state = State.WAIT
+                elif self.state == State.GRASP_OBJECT:
+                    success = self.grasp()
+                    if success:
+                        self.logger.info("抓取成功")
+                        user_ack = ""
+                        while user_ack.lower() != 'ok':
+                            user_ack = input("物体已抓取。输入 'ok' 使机器人头部恢复至0度并继续: ")
+                            if user_ack.lower() != 'ok':
+                                self.logger.info("输入无效，请输入 'ok'。")
+                        self.logger.info("用户已确认。机器人头部恢复至0度俯仰角...")
+                        if self.pitch_controller:
+                            self.pitch_controller.reset_pitch()
+                            interpolation_duration = self.pitch_controller._shared_state.get('interpolation_duration_s',
+                                                                                             2.0)
+                            self.logger.info(f"等待 {interpolation_duration:.1f}s 以完成头部归位...")
+                            self.logger.info("头部归位完成。")
+                        else:
+                            self.logger.warning("PitchController 不可用，无法恢复头部姿态。")
+                        self._next_state = State.SEND_NEXT_COMMAND
+                        self.state = State.WAIT
+                    else:
+                        self.logger.warning("抓取失败，重试降低头部")
+                        self._next_state = State.LOWER_HEAD
+                        self.state = State.WAIT
+                elif self.state == State.SEND_NEXT_COMMAND:
+                    self.send_next_to_vlm()
+                    next_coord_relative = self.get_next_target_from_vlm()  # This is relative
+                    target_list[1]["coord"] = next_coord_relative  # Update target_list with new relative coord
+                    self.logger.info(f"SEND_NEXT_COMMAND: Updated person target (relative): {next_coord_relative}")
+                    self._next_state = State.NAVIGATE_TO_PERSON
+                    self.state = State.WAIT
+                elif self.state == State.NAVIGATE_TO_PERSON:
+                    relative_coord = target_list[1]["coord"]  # This uses the (potentially updated) relative coord
+                    global_nav_goal = self.convert_relative_to_global(relative_coord)
+                    self.logger.info(
+                        f"NAVIGATE_TO_PERSON: Targeting global goal {global_nav_goal} (from relative {relative_coord})")
+                    self.navigate_to(global_nav_goal)
+                    self._next_state = State.RELEASE_OBJECT
+                    self.state = State.WAIT
+                elif self.state == State.RELEASE_OBJECT:
+                    self.release()
+                    self.logger.info("任务完成")
+                    self._next_state = State.DONE
+                    self.state = State.WAIT
+                time.sleep(0.2)
+            except Exception as e:
+                self.logger.error(f"运行循环错误: {e}")
+
+                break
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(f"用法: python3 {sys.argv[0]} networkInterface")
+        sys.exit(-1)
+
+    print("警告：请确保机器人周围没有障碍物。")
+    input("按 Enter 键继续...")
+
+    try:
+        ChannelFactoryInitialize(0, sys.argv[1])
+        controller = RobotController()
+        controller.run()
+    except Exception as e:
+        logging.error(f"程序终止: {e}")
+    finally:
+        try:
+            if 'controller' in locals() and controller and hasattr(controller,
+                                                                   'pitch_controller') and controller.pitch_controller:
+                logging.info("正在停止 PitchController...")
+                controller.pitch_controller.stop_control(transition_to_zero_pitch=True)  # 确保平滑过渡到0
+            if 'controller' in locals() and controller and hasattr(controller, 'sport_client'):
+                controller.stop_moving(identifier=99)  # Using a distinct ID for final stop
+                logging.info("机器人已停止移动 (via stop_moving method)")
+        except Exception as e:
+            logging.error(f"清理过程中发生错误: {e}")

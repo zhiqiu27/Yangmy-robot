@@ -1,0 +1,22 @@
+<launch>
+  <!-- Arguments -->
+  <arg name="network_interface" default="eth0" />
+  <arg name="test_mode" default="false" />
+  <arg name="camera_fps" default="24" />
+  <arg name="camera_resolution" default="VGA" />
+  
+  <!-- Vision system node -->
+  <node name="position_detector_node" pkg="robot_vision" type="position_detector_node.py" output="screen">
+    <param name="test_mode" value="$(arg test_mode)" />
+    <param name="camera_fps" value="$(arg camera_fps)" />
+    <param name="camera_resolution" value="$(arg camera_resolution)" />
+  </node>
+  
+  <!-- Robot state machine node -->
+  <node name="state_machine" pkg="robot_control" type="state_machine.py" output="screen" args="$(arg network_interface)" />
+  
+  <!-- Optionally enable ROS visualization tools -->
+  <group if="$(arg test_mode)">
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find robot_vision)/config/vision_test.rviz" />
+  </group>
+</launch> 
