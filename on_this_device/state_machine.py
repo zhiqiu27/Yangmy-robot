@@ -338,19 +338,20 @@ class RobotController:
     #     return False
 
     # 新方法1：前进到确认深度并进行偏航对准
-    def _approach_and_confirm_alignment(self, target_confirm_depth=0.3, yaw_pixel_tolerance_confirm=2, max_approach_time=20.0, max_align_time_at_depth=10.0, control_period=0.05):
-        self.logger.info(f"接近并确认对准阶段：目标深度 {target_confirm_depth:.2f}m, 像素容忍度 {yaw_pixel_tolerance_confirm}px")
-        start_approach_time = time.time()
+    def _approach_and_confirm_alignment(self, target_confirm_depth=0.3, target_grasp_depth=0.15, yaw_pixel_tolerance_confirm=2, max_approach_time=20.0, max_align_time_at_depth=10.0, max_crawl_time=100.0, control_period=0.05):
+        self.logger.info(f"精细接近与对准流程开始：阶段A目标深度 {target_confirm_depth:.2f}m, 阶段C目标抓取深度 {target_grasp_depth:.2f}m")
+        start_process_time = time.time() # Overall time for the entire 3-stage process
         
-        approach_vx = 0.02  # 接近时的慢速
+        approach_vx = 0.02  # 接近时的慢速 (阶段A)
+        crawl_vx = 0.015    # 最后爬行时的极慢速 (阶段C)
         
-        self.yaw_pid_visual.reset() # 重置视觉偏航PID
+        self.yaw_pid_visual.reset() # 重置视觉偏航PID一次，供整个过程使用
 
         # 阶段 A: 前进到 target_confirm_depth
-        self.logger.info(f"  子阶段A: 前进至深度 {target_confirm_depth:.2f}m")
-        current_depth_x_at_align_start = None # 用于日志
-
-        while time.time() - start_approach_time < max_approach_time:
+        self.logger.info(f"  --- 阶段 A: 前进至深度 {target_confirm_depth:.2f}m 开始 ---")
+        current_depth_x_for_logging = None 
+        start_stage_A_time = time.time()
+        while time.time() - start_stage_A_time < max_approach_time:
             vyaw = 0.0
             vx = 0.0
             current_depth_x = None
@@ -360,23 +361,23 @@ class RobotController:
                 pixel_cx = visual_info['pixel_cx']
                 image_width = visual_info['image_width']
                 current_depth_x = visual_info.get('depth_x')
-                current_depth_x_at_align_start = current_depth_x # 更新一下，用于后续日志
+                current_depth_x_for_logging = current_depth_x
 
                 if current_depth_x is not None:
-                    self.logger.info(f"  对准前接近 - 实时深度X: {current_depth_x:.3f} m")
+                    self.logger.info(f"  阶段A - 实时深度X: {current_depth_x:.3f} m")
                     if current_depth_x <= target_confirm_depth: 
-                        self.logger.info(f"  子阶段A: 已到达或小于目标确认深度 {target_confirm_depth:.2f}m。当前深度: {current_depth_x:.2f}m。停止前进，开始对准。")
-                        self.sport_client.StopMove()
+                        self.logger.info(f"  阶段A: 已到达或小于目标确认深度 {target_confirm_depth:.2f}m (当前: {current_depth_x:.2f}m)。结束阶段A前进。")
+                        #self.sport_client.StopMove()
                         break 
                 else: 
-                    self.logger.info("  对准前接近 - 实时深度X: 未获取到 (None)。机器人将不前进。")
+                    self.logger.info("  阶段A - 实时深度X: 未获取到 (None)。机器人将不前进。")
                     self.sport_client.StopMove()
-                    # Consider returning False or retrying a few times
-                    # For now, let it try again in the loop or timeout
+                    # Consider if this should be an immediate failure of the whole process
 
                 target_pixel_x = image_width / 2.0
                 pixel_error = pixel_cx - target_pixel_x
-                if abs(pixel_error) > yaw_pixel_tolerance_confirm: 
+                # Use a slightly more relaxed tolerance for yaw during initial approach to 0.3m
+                if abs(pixel_error) > (yaw_pixel_tolerance_confirm + 2): # e.g. 4px if confirm is 2px
                     vyaw = self.yaw_pid_visual(pixel_error)
                     if 0 < abs(vyaw) < MIN_EFFECTIVE_VYAW:
                         vyaw = math.copysign(MIN_EFFECTIVE_VYAW, vyaw)
@@ -387,83 +388,81 @@ class RobotController:
                     vx = 0.0
             
             elif visual_info and not visual_info.get('bbox_available'):
-                self.logger.warning("  对准前接近: 未检测到边界框。机器人停止移动。")
+                self.logger.warning("  阶段A: 未检测到边界框。机器人停止移动。流程失败。")
                 self.sport_client.StopMove()
                 return False 
-            else: 
-                self.logger.error("  对准前接近: 从服务器获取视觉信息失败。机器人停止移动。")
+            else: # visual_info is None
+                self.logger.error("  阶段A: 从服务器获取视觉信息失败。机器人停止移动。流程失败。")
                 self.sport_client.StopMove()
                 return False
 
-            self.logger.info(f"  对准前接近 - vx: {vx:.3f}, vyaw: {vyaw:.3f}, CurDepth: {current_depth_x}")
+            self.logger.info(f"  阶段A - vx: {vx:.3f}, vyaw: {vyaw:.3f}, CurDepth: {current_depth_x}")
             self.try_move(vx, 0.0, vyaw, 15) 
             time.sleep(control_period)
             
-            if time.time() - start_approach_time >= max_approach_time and (current_depth_x is None or current_depth_x > target_confirm_depth) : 
-                 self.logger.error(f"  子阶段A: 前进至确认深度 {target_confirm_depth:.2f}m 超时。")
-                 self.sport_client.StopMove()
-                 return False
+            if time.time() - start_stage_A_time >= max_approach_time: # Check for stage A timeout specifically
+                 if current_depth_x is None or current_depth_x > target_confirm_depth:
+                     self.logger.error(f"  --- 阶段 A: 前进至确认深度 {target_confirm_depth:.2f}m 超时。流程失败。 ---")
+                     self.sport_client.StopMove()
+                     return False
+        self.logger.info(f"  --- 阶段 A: 前进至深度 {target_confirm_depth:.2f}m 完成。 ---")
 
-        # 阶段 B: 在 target_confirm_depth 进行精确偏航对准
-        log_depth_for_align_phase = current_depth_x_at_align_start if current_depth_x_at_align_start is not None else "未知"
-        self.logger.info(f"  子阶段B: 在当前深度 (~{log_depth_for_align_phase}m) 进行精确偏航对准，目标像素容忍度: {yaw_pixel_tolerance_confirm}px")
-        start_align_time = time.time()
-        # self.yaw_pid_visual.reset() # Already reset at the beginning of this method
+        # 阶段 B: 在 target_confirm_depth (~0.3m) 进行精确偏航对准
+        self.logger.info(f"  --- 阶段 B: 在当前深度 (~{current_depth_x_for_logging if current_depth_x_for_logging is not None else '未知'}m) 进行精确偏航对准 (容忍度: {yaw_pixel_tolerance_confirm}px) 开始 ---")
+        start_stage_B_time = time.time()
+        # self.yaw_pid_visual.reset() # Already reset at the beginning of the method
 
-        while time.time() - start_align_time < max_align_time_at_depth:
+        while time.time() - start_stage_B_time < max_align_time_at_depth:
             vyaw = 0.0
             visual_info = self._request_visual_info_from_server()
 
             if visual_info and visual_info.get('bbox_available'):
                 pixel_cx = visual_info['pixel_cx']
                 image_width = visual_info['image_width']
-                # Optional: log current_depth_x here too, but it's not used for control in this sub-phase
-                # current_depth_x_during_align = visual_info.get('depth_x')
-                # self.logger.debug(f"  精确对准中 - CurDepth: {current_depth_x_during_align}")
+                # depth_at_align = visual_info.get('depth_x') # For logging if needed
 
                 target_pixel_x = image_width / 2.0
                 pixel_error = pixel_cx - target_pixel_x
-                self.logger.info(f"  精确对准中 - PxErr: {pixel_error:.1f} (目标容忍度: +/-{yaw_pixel_tolerance_confirm}px)")
+                self.logger.info(f"  阶段B - 精确对准中 - PxErr: {pixel_error:.1f}")
 
                 if abs(pixel_error) < yaw_pixel_tolerance_confirm:
-                    self.logger.info(f"  子阶段B: 精确偏航对准完成。像素误差: {pixel_error:.1f}")
-                    self.sport_client.StopMove()
-                    return True 
+                    self.logger.info(f"  阶段B: 精确偏航对准完成。像素误差: {pixel_error:.1f}")
+                    break # 对准成功，跳出对准循环，进入阶段C
 
-                vyaw = self.yaw_pid_visual(pixel_error)
-                if 0 < abs(vyaw) < MIN_EFFECTIVE_VYAW:
-                    vyaw = math.copysign(MIN_EFFECTIVE_VYAW, vyaw)
-                
-                self.try_move(0.0, 0.0, vyaw, 16) 
+                # Set vyaw to a fixed value based on the direction of the pixel error
+                if pixel_error > 0:
+                    vyaw = -0.1  # Turn right
+                else:
+                    vyaw = 0.1   # Turn left
+
+                self.try_move(0.0, 0.0, vyaw, 16)
             
             elif visual_info and not visual_info.get('bbox_available'):
-                self.logger.warning("  精确对准中: 未检测到边界框。对准失败。")
+                self.logger.warning("  阶段B: 精确对准中未检测到边界框。对准失败。流程失败。")
                 self.sport_client.StopMove()
                 return False
-            else: 
-                self.logger.error("  精确对准中: 从服务器获取视觉信息失败。对准失败。")
+            else: # visual_info is None
+                self.logger.error("  阶段B: 精确对准中从服务器获取视觉信息失败。对准失败。流程失败。")
                 self.sport_client.StopMove()
                 return False
             
             time.sleep(control_period)
+            
+            if time.time() - start_stage_B_time >= 50: # Check for stage B timeout
+                self.logger.error(f"  --- 阶段 B: 精确偏航对准超时。流程失败。 ---")
+                self.sport_client.StopMove()
+                return False
+        self.logger.info(f"  --- 阶段 B: 精确偏航对准完成。 ---")
 
-        self.logger.error(f"  子阶段B: 精确偏航对准超时。")
-        self.sport_client.StopMove()
-        return False
+        # 阶段 C: 最后一段爬行至抓取深度 target_grasp_depth (~0.15m)
+        self.logger.info(f"  --- 阶段 C: 最后爬行至抓取深度 {target_grasp_depth:.2f}m 开始 ---")
+        start_stage_C_time = time.time()
+        # self.yaw_pid_visual.reset() # Usually not needed here if stage B aligned well
 
-    # 新方法2：最后一段爬行至抓取深度
-    def _final_crawl_to_grasp(self, target_grasp_depth=0.15, max_crawl_time=10.0, control_period=0.05):
-        self.logger.info(f"最终爬行阶段：前进至目标抓取深度 {target_grasp_depth:.2f}m")
-        start_time = time.time()
-        
-        crawl_vx = 0.015  # 非常非常慢的前进速度 (例如 1.5 cm/s)
-        
-        # self.yaw_pid_visual.reset() # Probably not needed if previous step aligned well
-
-        while time.time() - start_time < max_crawl_time:
-            vyaw = 0.0
+        while time.time() - start_stage_C_time < max_crawl_time:
+            vyaw = 0.0 # Default to no yaw adjustment unless needed
             vx = 0.0
-            current_depth_x = None
+            current_depth_x = None # Reset for fresh read
             visual_info = self._request_visual_info_from_server()
 
             if visual_info and visual_info.get('bbox_available'):
@@ -472,48 +471,52 @@ class RobotController:
                 current_depth_x = visual_info.get('depth_x')
 
                 if current_depth_x is not None:
-                    self.logger.info(f"  最终爬行 - 实时深度X: {current_depth_x:.3f} m")
+                    self.logger.info(f"  阶段C - 最终爬行 - 实时深度X: {current_depth_x:.3f} m")
                     if current_depth_x < target_grasp_depth:
-                        self.logger.info(f"  最终爬行 - 目标抓取深度 {target_grasp_depth:.2f}m 已达到。当前深度: {current_depth_x:.2f}m。机器人停止。")
+                        self.logger.info(f"  阶段C - 目标抓取深度 {target_grasp_depth:.2f}m 已达到 (当前: {current_depth_x:.2f}m)。机器人停止。流程成功！")
                         self.sport_client.StopMove()
-                        return True 
+                        return True # Entire 3-stage process successful
                 else:
-                    self.logger.info("  最终爬行 - 实时深度X: 未获取到 (None)。机器人将不前进。")
+                    self.logger.info("  阶段C - 最终爬行 - 实时深度X: 未获取到 (None)。机器人将不前进。流程失败。")
                     self.sport_client.StopMove()
-                    return False 
+                    return False # Losing depth at this stage is critical
 
                 # 微弱的偏航调整 (可选, 如果需要保持在爬行时对准)
                 target_pixel_x = image_width / 2.0
                 pixel_error = pixel_cx - target_pixel_x
-                yaw_pixel_tolerance_crawl = 4 # 爬行时容忍度可以稍大
+                yaw_pixel_tolerance_crawl = 4 # 爬行时容忍度可以稍大，主要靠直线
                 if abs(pixel_error) > yaw_pixel_tolerance_crawl:
                     vyaw_raw = self.yaw_pid_visual(pixel_error) 
                     vyaw = vyaw_raw * 0.3 # 大幅减弱偏航调整效果
-                    if 0 < abs(vyaw) < MIN_EFFECTIVE_VYAW * 0.3: 
+                    if 0 < abs(vyaw) < MIN_EFFECTIVE_VYAW * 0.3: # 更小的有效vyaw (可调)
                         vyaw = math.copysign(MIN_EFFECTIVE_VYAW * 0.3, vyaw)
-                    self.logger.debug(f"  最终爬行 - 微弱偏航调整: PxErr {pixel_error:.1f}, vyaw_raw {vyaw_raw:.3f}, vyaw_adj {vyaw:.3f}")
+                    self.logger.debug(f"  阶段C - 微弱偏航调整: PxErr {pixel_error:.1f}, vyaw_raw {vyaw_raw:.3f}, vyaw_adj {vyaw:.3f}")
             
                 if current_depth_x is not None and current_depth_x >= target_grasp_depth:
                     vx = crawl_vx
                 else:
-                    vx = 0.0
+                    vx = 0.0 #已到达或深度无效
 
             elif visual_info and not visual_info.get('bbox_available'):
-                self.logger.warning("  最终爬行: 未检测到边界框。机器人停止移动。")
+                self.logger.warning("  阶段C - 最终爬行: 未检测到边界框。机器人停止移动。流程失败。")
                 self.sport_client.StopMove()
                 return False 
-            else: 
-                self.logger.error("  最终爬行: 从服务器获取视觉信息失败。机器人停止移动。")
+            else: # visual_info is None
+                self.logger.error("  阶段C - 最终爬行: 从服务器获取视觉信息失败。机器人停止移动。流程失败。")
                 self.sport_client.StopMove()
                 return False
 
-            self.logger.info(f"  最终爬行 - vx: {vx:.3f}, vyaw: {vyaw:.3f}, CurDepth: {current_depth_x}")
+            self.logger.info(f"  阶段C - vx: {vx:.3f}, vyaw: {vyaw:.3f}, CurDepth: {current_depth_x}")
             self.try_move(vx, 0.0, vyaw, 17) 
             time.sleep(control_period)
 
-        self.logger.error(f"最终爬行: 前进至抓取深度 {target_grasp_depth:.2f}m 超时。")
+        self.logger.error(f"  --- 阶段 C: 最终爬行至抓取深度 {target_grasp_depth:.2f}m 超时。流程失败。 ---")
         self.sport_client.StopMove()
         return False
+
+    # Remove or comment out the old _final_crawl_to_grasp method as its logic is now in stage C
+    # def _final_crawl_to_grasp(self, target_grasp_depth=0.15, max_crawl_time=10.0, control_period=0.05):
+    #     ...
 
     def _phase1_rotate_to_target(self, global_goal, initial_yaw, yaw_tolerance, max_rot_time, control_period):
         """第一阶段：只旋转朝向目标"""
@@ -1024,7 +1027,7 @@ class RobotController:
                 if self.state == State.WAIT:
                     # self.stop_moving() # Original comment
                     # ret1 = self.sport_client.SwitchGait(0) # Original comment
-                    # ret2 = self.sport_client.StopMove() # Ensures robot is stopped in WAIT - USER REQUESTED REMOVAL
+                    ret2 = self.sport_client.StopMove() # Ensures robot is stopped in WAIT - USER REQUESTED REMOVAL
                     self.logger.info(f"进入WAIT状态 (StopMove 已移除)。下一个状态: {getattr(self, '_next_state', 'None')}")
                     time.sleep(1) # General wait time
                     
@@ -1122,7 +1125,7 @@ class RobotController:
                     # 1. 降低机身高度到最小值
                     self.logger.info(f"精细调整：步骤1 - 设置机身相对高度为最小值 {self.BODY_HEIGHT_REL_MIN}m")
                     if self.set_body_height_relative(self.BODY_HEIGHT_REL_MIN):
-                        time.sleep(2.5) # 给机器人足够的时间降低身体
+                        time.sleep(2) # 给机器人足够的时间降低身体
                         self.logger.info("精细调整：机身高度调整完成。")
                         # 2. 降低抬足高度到最小值 (只有在机身高度调整成功后才进行)
                         self.logger.info(f"精细调整：步骤2 - 设置抬足相对高度为最小值 {self.FOOT_RAISE_REL_MIN}m")
@@ -1164,31 +1167,25 @@ class RobotController:
                         self.state = State.DONE # Or an error state
                         continue
                         
-                    # 4. 接近到0.3m并确认对准
-                    self.logger.info("精细调整：步骤4 - 接近到0.3m并确认对准")
-                    approach_and_align_succeeded = self._approach_and_confirm_alignment(target_confirm_depth=0.3, yaw_pixel_tolerance_confirm=2)
+                    # 4. 执行完整精细接近、对准和最终爬行流程
+                    self.logger.info("精细调整：步骤4 - 开始完整精细接近、对准和最终爬行流程")
+                    # 调用统一的方法，它内部处理0.3m对准和0.15m抓取深度
+                    overall_fine_approach_succeeded = self._approach_and_confirm_alignment(
+                        target_confirm_depth=0.3, 
+                        target_grasp_depth=0.15, 
+                        yaw_pixel_tolerance_confirm=2
+                        # max_approach_time, max_align_time_at_depth, max_crawl_time, control_period 沿用方法中的默认值或按需传递
+                    )
 
-                    if approach_and_align_succeeded:
-                        self.logger.info("精细调整：成功到达0.3m并完成视觉对准。")
-                        # 5. 最后爬行到0.15m进行抓取
-                        self.logger.info("精细调整：步骤5 - 最后爬行到0.15m准备抓取")
-                        final_crawl_succeeded = self._final_crawl_to_grasp(target_grasp_depth=0.15)
-                        
-                        if final_crawl_succeeded:
-                            self.logger.info("精细调整：成功前进至最终抓取深度 (<0.15m)。")
-                            self._next_state = State.GRASP_OBJECT 
-                            self.state = State.WAIT
-                        else:
-                            self.logger.error("精细调整：未能成功爬行至最终抓取深度。恢复默认姿态并中止操作。")
-                            self.reset_body_and_foot_height()
-                            if self.pitch_controller: self.pitch_controller.reset_pitch()
-                            time.sleep(self.pitch_controller._shared_state.get('interpolation_duration_s', 2.0) + 1.0)
-                            self.state = State.DONE # Or an error state
+                    if overall_fine_approach_succeeded:
+                        self.logger.info("精细调整：完整流程成功完成（已到达~0.15m并对准）。")
+                        self._next_state = State.GRASP_OBJECT 
+                        self.state = State.WAIT
                     else:
-                        self.logger.error("精细调整：未能成功接近0.3m并完成对准。恢复默认姿态并中止操作。")
+                        self.logger.error("精细调整：完整精细接近、对准或最终爬行流程失败。恢复默认姿态并中止操作。")
                         self.reset_body_and_foot_height()
                         if self.pitch_controller: self.pitch_controller.reset_pitch()
-                        time.sleep(self.pitch_controller._shared_state.get('interpolation_duration_s', 2.0) + 1.0)
+                        time.sleep(self.pitch_controller._shared_state.get('interpolation_duration_s', 2.0) + 1.0) # 等待姿态恢复
                         self.state = State.DONE # Or an error state
 
                 elif self.state == State.LOWER_HEAD:
