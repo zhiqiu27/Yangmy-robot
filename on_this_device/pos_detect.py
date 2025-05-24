@@ -26,12 +26,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_IMAGE_PORT = 12345
 DEFAULT_BBOX_PORT = 12346
 
+# New: Timeout configurations
+DEFAULT_MAX_FRAME_PROCESSING_TIME_SECONDS = 0.5 # Skip frame if ZED processing + encoding takes longer
+DEFAULT_SEND_OPERATION_TIMEOUT_SECONDS = 0.5    # Timeout for individual socket sendall operations in _send_all
+
 class PositionDetector:
-    def __init__(self, image_port=DEFAULT_IMAGE_PORT, bbox_port=DEFAULT_BBOX_PORT, camera_fps=24, camera_resolution_str="VGA"):
+    def __init__(self, image_port=DEFAULT_IMAGE_PORT, bbox_port=DEFAULT_BBOX_PORT, camera_fps=24, camera_resolution_str="VGA",
+                 max_frame_processing_time=DEFAULT_MAX_FRAME_PROCESSING_TIME_SECONDS,
+                 send_operation_timeout=DEFAULT_SEND_OPERATION_TIMEOUT_SECONDS):
         logger.info("Initializing PositionDetector...")
         self.image_port = image_port
         self.bbox_port = bbox_port
         self.camera_fps = camera_fps
+        self.max_frame_processing_time = max_frame_processing_time
+        self.send_operation_timeout = send_operation_timeout
         
         if camera_resolution_str.upper() == "VGA":
             self.camera_resolution = sl.RESOLUTION.VGA
@@ -126,11 +134,13 @@ class PositionDetector:
         return median_coord
 
     def _send_all(self, sock, data):
+        original_timeout = sock.gettimeout()
         try:
+            sock.settimeout(self.send_operation_timeout) # Use configured timeout
             sock.sendall(data)
             return True
         except socket.timeout:
-            logger.warning("Socket timeout during send.")
+            logger.warning(f"Socket timeout during sendall after {self.send_operation_timeout}s. Client may be unresponsive or network issue.")
             return False
         except socket.error as e:
             if e.errno == socket.errno.EPIPE or e.errno == socket.errno.ECONNRESET:
@@ -138,6 +148,8 @@ class PositionDetector:
             else:
                 logger.error(f"Socket error during send: {e}")
             return False
+        finally:
+            sock.settimeout(original_timeout) # Restore original timeout
 
     def _receive_all(self, sock, n):
         data_buffer = bytearray()
@@ -341,6 +353,8 @@ class PositionDetector:
                 continue
 
             if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
+                frame_process_start_time = time.time() # Start timing for frame processing
+
                 self.zed.retrieve_image(self.img_mat, sl.VIEW.LEFT)
                 self.zed.retrieve_measure(self.xyz_mat, sl.MEASURE.XYZ)
 
@@ -392,20 +406,22 @@ class PositionDetector:
                 encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40] # Quality 40 for less bandwidth
                 result, frame_jpeg = cv2.imencode('.jpg', rgb_image_cpu, encode_param)
 
-                if result:
+                frame_process_duration = time.time() - frame_process_start_time
+
+                if frame_process_duration > self.max_frame_processing_time:
+                    logger.warning(f"Frame processing ({frame_process_duration:.3f}s) exceeded max time ({self.max_frame_processing_time}s). Skipping frame.")
+                elif result:
                     try:
                         self.image_queue.put_nowait((len(frame_jpeg), frame_jpeg.tobytes()))
                     except queue.Full:
-                        # logger.warning("IMAGE_QUEUE full, frame dropped by ZED loop.") # Can be too verbose
-                        # To prevent spam if queue is often full, clear one item and try again or just drop
                         try:
                             self.image_queue.get_nowait() # Clear one old item
                             self.image_queue.put_nowait((len(frame_jpeg), frame_jpeg.tobytes()))
-                        except queue.Empty: # Should not happen if it was full
+                        except queue.Empty:
                             pass
-                        except queue.Full: # Still full after clearing one, just drop
+                        except queue.Full:
                             logger.warning("IMAGE_QUEUE still full after clearing one item, frame dropped.")
-                else:
+                elif not result: # Explicitly check for result being False if not skipped
                     logger.error("JPEG encoding failed.")
                     try:
                         self.image_queue.put_nowait((0, b'')) # Signal encoding error
