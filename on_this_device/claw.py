@@ -6,7 +6,7 @@ def send_hex_to_com6(hex_data):
     try:
         # 配置串口
         ser = serial.Serial(
-            port='/dev/wheeltec_mic',
+            port='/dev/ttyACM0',
             baudrate=115200,  # 波特率，可根据需要修改
             timeout=1
         )

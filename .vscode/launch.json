@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${file}",
             "args": "eth0",
-            "python": "/home/unitree/miniconda3/envs/yolov5/bin/python",
+            "python": "/home/unitree/anaconda3/envs/yolov5/bin/python",
             "console": "integratedTerminal"
         }
     ]
