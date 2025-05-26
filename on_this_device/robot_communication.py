@@ -149,31 +149,34 @@ class RobotCommunication:
     
     def send_next_target_command(self):
         """发送NEXT_TARGET命令到PC端"""
-        logger.info(f"向PC端发送NEXT_TARGET命令 (端口 {self.next_target_port})")
+        logger.info(f"向图像服务器发送TRIGGER_VIEWER_NEXT_TARGET命令")
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(5)
-                s.connect((self.image_server_host, self.next_target_port))
-                logger.info("已连接到PC端NEXT_TARGET服务")
+                s.connect((self.image_server_host, self.image_server_port))  # 连接到50001而不是12347
+                logger.info("已连接到图像服务器")
                 
-                s.sendall(b"NEXT_TARGET")
-                logger.info("已发送 'NEXT_TARGET' 命令")
+                s.sendall(b"TRIGGER_VIEWER_NEXT_TARGET")  # 发送正确的命令
+                logger.info("已发送 'TRIGGER_VIEWER_NEXT_TARGET' 命令")
                 
-                # 等待确认响应
+                # 等待JSON响应
                 response_data = s.recv(1024)
                 if response_data:
-                    response = response_data.decode().strip()
-                    logger.info(f"PC端响应: {response}")
-                    return response == "ACK"
+                    response = json.loads(response_data.decode())
+                    logger.info(f"图像服务器响应: {response}")
+                    return response.get("status") == "success"
                 else:
-                    logger.error("PC端无响应")
+                    logger.error("图像服务器无响应")
                     return False
                     
         except socket.timeout:
-            logger.error(f"连接PC端NEXT_TARGET服务超时")
+            logger.error(f"连接图像服务器超时")
             return False
         except socket.error as e:
-            logger.error(f"与PC端NEXT_TARGET服务通信时发生套接字错误: {e}")
+            logger.error(f"与图像服务器通信时发生套接字错误: {e}")
+            return False
+        except json.JSONDecodeError as e:
+            logger.error(f"解析图像服务器JSON响应时出错: {e}")
             return False
         except Exception as e:
             logger.error(f"发送NEXT_TARGET命令时发生意外错误: {e}")

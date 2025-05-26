@@ -19,7 +19,7 @@ DIRECTION_COMMAND_PORT = 50002
 NEXT_TARGET_PORT = 12347  # PC端用于接收NEXT_TARGET命令的端口
 
 # 机器人物理参数
-CLAW_OFFSET_FORWARD = 0  # 机器人中心到爪子前端的距离(米)
+CLAW_OFFSET_FORWARD = 0.08  # 机器人中心到爪子前端的距离(米)
 
 # 运动控制参数
 MIN_EFFECTIVE_VYAW = 0.08  # 最小有效偏航速度(rad/s)
@@ -38,6 +38,19 @@ YAW_PID_FINE_PARAMS = {'Kp': 0.25, 'Ki': 0.01, 'Kd': 0.15, 'output_limits': (-0.
 DIST_PID_PARAMS = {'Kp': 0.25, 'Ki': 0.0, 'Kd': 0.25, 'setpoint': 0, 'output_limits': (-0.3, 0.3)}
 YAW_PID_VISUAL_PARAMS = {'Kp': 0.001, 'Ki': 0.00005, 'Kd': 0.0005, 'output_limits': (-0.3, 0.3), 'setpoint': 0}
 
+# 方向旋转PID参数
+DIRECTION_ROTATION_PID_PARAMS = {
+    'Kp': 0.4,           # 比例系数
+    'Ki': 0.01,          # 积分系数
+    'Kd': 0.1,           # 微分系数
+    'max_integral': 1.0, # 积分饱和保护
+    'tolerance': 0.087,  # 容差（约5度）
+    'timeout': 18.0,      # 超时时间（秒）
+    'max_speed_base': 0.4,    # 基础最大速度
+    'min_speed': 0.1,         # 最小速度
+    'speed_factor': 0.6       # 速度因子
+}
+
 # 导航参数
 NAVIGATION_CONTROL_PERIOD = 0.02
 YAW_TOLERANCE = 0.08
@@ -49,7 +62,7 @@ TARGET_DEPTH = 0.8  # 目标深度(米)
 # 视觉对准参数
 YAW_PIXEL_TOLERANCE = 3
 YAW_PIXEL_TOLERANCE_PHASE2 = 3
-YAW_PIXEL_TOLERANCE_CONFIRM = 5
+YAW_PIXEL_TOLERANCE_CONFIRM = 3
 YAW_PIXEL_TOLERANCE_CRAWL = 4
 MAX_VISUAL_ALIGN_TIME = 20.0
 MAX_CONSECUTIVE_NO_BBOX = 10
@@ -65,10 +78,10 @@ CRAWL_VX = 0.015
 
 # 俯仰角参数
 DESIRED_PITCH_ANGLE = 20.0
-GRASP_PITCH_ANGLE = 10.0
+GRASP_PITCH_ANGLE = 12
 
 # 串口参数
-SERIAL_PORT = '/dev/ttyACM0'
+SERIAL_PORT = '/dev/wheeltec_mic'
 SERIAL_BAUDRATE = 115200
 
 # 爪子控制命令

@@ -9,6 +9,7 @@ import math
 import logging
 from robot_config import *
 from robot_utils import send_hex_to_serial, normalize_angle
+from robot_state import robot_state, get_robot_state, get_robot_position
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,12 @@ class RobotControl:
     
     def execute_direction_rotation(self, direction, robot_state):
         """根据方向命令执行旋转"""
-        if robot_state is None:
+        # 导入机器人状态获取函数
+
+        
+        # 获取最新的机器人位置信息
+        current_position = get_robot_position()
+        if current_position is None:
             logger.error("机器人状态不可用，无法执行方向旋转")
             return False
         
@@ -168,30 +174,111 @@ class RobotControl:
             logger.error(f"未知的方向命令: {direction}")
             return False
         
-        # 获取当前状态
-        current_x = robot_state.position[0]
-        current_y = robot_state.position[1]
-        current_yaw = robot_state.imu_state.rpy[2]
+        # 获取初始状态
+        current_x = current_position['x']
+        current_y = current_position['y']
+        initial_yaw = current_position['yaw']  # 记录初始角度
         
         # 计算新的yaw角度
         angle_increment = DIRECTION_ANGLES[direction]
-        new_yaw = normalize_angle(current_yaw + angle_increment)
+        new_yaw = normalize_angle(initial_yaw + angle_increment)
         
         logger.info(f"执行方向旋转: {direction}")
-        logger.info(f"当前位置: ({current_x:.3f}, {current_y:.3f}, yaw: {current_yaw:.3f})")
+        logger.info(f"当前位置: ({current_x:.3f}, {current_y:.3f}, yaw: {initial_yaw:.3f})")
         logger.info(f"目标位置: ({current_x:.3f}, {current_y:.3f}, yaw: {new_yaw:.3f})")
+        logger.info(f"需要旋转角度: {angle_increment:.3f} 弧度 ({math.degrees(angle_increment):.1f}°)")
+        
+        # 从配置文件获取PID参数
+        pid_params = DIRECTION_ROTATION_PID_PARAMS
         
         try:
-            ret = self.sport_client.MoveToPos(current_x, current_y, new_yaw)
-            if ret == 0:
-                logger.info(f"方向旋转命令发送成功: {direction}")
-                time.sleep(3.0)  # 等待旋转完成
-                return True
-            else:
-                logger.error(f"MoveToPos调用失败，错误码: {ret}")
-                return False
+            # PID参数
+            Kp = pid_params['Kp']
+            Ki = pid_params['Ki']
+            Kd = pid_params['Kd']
+            max_integral = pid_params['max_integral']
+            tolerance = pid_params['tolerance']
+            timeout = pid_params['timeout']
+            max_speed_base = pid_params['max_speed_base']
+            min_speed = pid_params['min_speed']
+            speed_factor = pid_params['speed_factor']
+            
+            integral = 0
+            prev_error = 0
+            start_time = time.time()
+            last_time = start_time
+            
+            while time.time() - start_time < timeout:
+                # 重新获取最新的机器人位置信息
+                current_position = get_robot_position()
+                if current_position is None:
+                    logger.error("机器人状态丢失，停止旋转")
+                    break
+                
+                # 获取当前yaw角
+                current_yaw = current_position['yaw']
+                current_time = time.time()
+                dt = current_time - last_time
+                
+                # 计算误差和已旋转角度
+                error = normalize_angle(new_yaw - current_yaw)
+                rotated_angle = normalize_angle(current_yaw - initial_yaw)
+                remaining_angle = normalize_angle(new_yaw - current_yaw)
+                
+                # 实时打印旋转进度
+                logger.info(f"旋转进度 - 需要: {math.degrees(angle_increment):.1f}°, "
+                           f"已转: {math.degrees(rotated_angle):.1f}°, "
+                           f"剩余: {math.degrees(remaining_angle):.1f}°, "
+                           f"误差: {math.degrees(error):.1f}°")
+                
+                # 更新积分和微分项（使用实际dt）
+                if dt > 0:
+                    integral += error * dt
+                    # 积分饱和保护
+                    integral = max(min(integral, max_integral), -max_integral)
+                    derivative = (error - prev_error) / dt
+                else:
+                    derivative = 0
+                
+                # PID控制器输出
+                vyaw = Kp * error + Ki * integral + Kd * derivative
+                
+                # 动态速度限制
+                max_speed = min(max_speed_base, max(min_speed, abs(error) * speed_factor))
+                vyaw = max(min(vyaw, max_speed), -max_speed)
+                
+                # 执行旋转
+                self.sport_client.Move(0.0, 0.0, vyaw)
+                
+                # 检查是否达到目标
+                if abs(error) < tolerance:
+                    self.sport_client.StopMove()
+                    time.sleep(0.1)  # 确保停止命令执行
+                    logger.info(f"方向旋转完成: {direction}")
+                    logger.info(f"最终旋转角度: {math.degrees(rotated_angle):.1f}°")
+                    return True
+                    
+                prev_error = error
+                last_time = current_time
+                time.sleep(0.1)
+            
+            # 超时处理
+            self.sport_client.StopMove()
+            time.sleep(0.1)
+            final_position = get_robot_position()
+            if final_position:
+                final_yaw = final_position['yaw']
+                final_rotated = normalize_angle(final_yaw - initial_yaw)
+                logger.warning(f"方向旋转超时 - 目标: {math.degrees(angle_increment):.1f}°, "
+                              f"实际: {math.degrees(final_rotated):.1f}°")
+            return False
+            
         except Exception as e:
             logger.error(f"执行方向旋转时发生错误: {e}")
+            try:
+                self.sport_client.StopMove()
+            except:
+                pass
             return False
     
     def prepare_for_grasp(self):

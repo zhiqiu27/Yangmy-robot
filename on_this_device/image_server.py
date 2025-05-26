@@ -325,6 +325,27 @@ class ImageProcessorServer:
                 self.logger.error(f"关闭 PositionDetector 时出错: {e}")
         self.logger.info("图像处理服务器已关闭。")
 
+    def send_next_target_command(self):
+        """发送NEXT_TARGET命令到PC端"""
+        logger.info(f"向图像服务器发送TRIGGER_VIEWER_NEXT_TARGET命令")
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5)
+                s.connect((self.host, self.port))  # 50001
+                logger.info("已连接到图像服务器")
+                
+                s.sendall(b"TRIGGER_VIEWER_NEXT_TARGET")  # 正确的命令
+                logger.info("已发送 'TRIGGER_VIEWER_NEXT_TARGET' 命令")
+                
+                response_data = s.recv(1024)
+                if response_data:
+                    response = json.loads(response_data.decode())
+                    logger.info(f"图像服务器响应: {response}")
+                    return response.get("status") == "success"
+        except Exception as e:
+            logger.error(f"发送NEXT_TARGET命令到图像服务器时发生错误: {e}")
+            return False
+
 if __name__ == "__main__":
     server = ImageProcessorServer()
     try:

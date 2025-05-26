@@ -333,12 +333,13 @@ class RobotNavigation:
             pixel_error = pixel_cx - image_width / 2.0
             
             vyaw = 0.0
-            if abs(pixel_error) > (YAW_PIXEL_TOLERANCE_CONFIRM + 2):
+            if abs(pixel_error) > YAW_PIXEL_TOLERANCE_CONFIRM and abs(pixel_error) < 160:
                 vyaw = -0.1 if pixel_error > 0 else 0.1
             
             # 前进控制
             vx = APPROACH_VX
             self.sport_client.Move(0.1, 0.0, vyaw)
+            print(f"阶段A - 前进速度: {vx:.3f}, 偏航速度: {vyaw:.3f}")
             time.sleep(NAVIGATION_CONTROL_PERIOD)
         
         logger.info("阶段A: 完成")

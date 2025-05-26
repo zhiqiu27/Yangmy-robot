@@ -217,6 +217,7 @@ class RobotStateMachine:
             self.logger.info("精细调整完成")
             self.control.grasp_object()
             time.sleep(1)
+            self.sport_client.StopMove()
             self._transition_to_state(State.GRASP_OBJECT)
         else:
             self.logger.error("精细调整失败")
@@ -226,7 +227,10 @@ class RobotStateMachine:
     def _handle_grasp_object(self):
         """处理抓取物体状态"""
         self.logger.info("进入 GRASP_OBJECT 状态")
-        self.control.stop_movement
+        self.control.stop_movement()
+        self.control.stop_movement()
+        self.control.stop_movement()
+        self.control.stop_movement()
         # 重新设置抓取姿态
         #self.control.prepare_for_grasp()
         
@@ -277,7 +281,7 @@ class RobotStateMachine:
         
         # 使用像素对齐并接近到1.5m的方法
         try:
-            success = self.navigation.approach_person_to_distance(target_distance=1.5)
+            success = self.navigation.approach_person_to_distance(target_distance=0.8)
             if success:
                 self.logger.info("成功接近人员到1.5m距离")
                 self._transition_to_state(State.RELEASE_OBJECT)
@@ -291,8 +295,12 @@ class RobotStateMachine:
     def _handle_release_object(self):
         """处理释放物体状态"""
         self.logger.info("进入 RELEASE_OBJECT 状态")
-        
+        self.sport_client.Sit()
+        time.sleep(3)
         self.control.release_object()
+        time.sleep(2)
+        self.sport_client.RiseSit()
+        time.sleep(2)
         self.logger.info("任务完成")
         self.state = State.DONE
 
