@@ -11,18 +11,47 @@ MODEL = None
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 ONTOLOGY = None
 
-def initialize_detection_model(model_path="D:/models", ontology_caption={"tennis ball": "a green bottle"}):
+def create_ontology_from_caption(ontology_caption):
+    """
+    Creates a new CaptionOntology from the given caption dictionary.
+    This is much faster than reinitializing the entire model.
+    
+    Args:
+        ontology_caption (dict): Dictionary mapping class names to captions
+        
+    Returns:
+        CaptionOntology: New ontology object, or None if creation fails
+    """
+    try:
+        new_ontology = CaptionOntology(ontology_caption)
+        print(f"Created new ontology with classes: {list(ontology_caption.keys())}")
+        return new_ontology
+    except Exception as e:
+        print(f"Error creating ontology from caption: {e}")
+        return None
+
+def initialize_detection_model(model_path="D:/models", ontology_caption={"1": "beanbag"}, force_reinit=False):
     """Initializes the Florence-2 model and ontology."""
     global MODEL, ONTOLOGY, DEVICE
-    if MODEL is None:
+    
+    if MODEL is None or force_reinit:
+        if force_reinit and MODEL is not None:
+            print("Force reinitializing model with new ontology...")
+            # Clear GPU memory if needed
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
         print(f"Using device: {DEVICE}")
         ONTOLOGY = CaptionOntology(ontology_caption)
         print("Loading Florence-2 model...")
         MODEL = Florence2(ontology=ONTOLOGY, model_id=model_path)
         print("Model loaded successfully.")
+    else:
+        print("Model already loaded, returning existing model.")
+    
     return MODEL, DEVICE, ONTOLOGY
 
-def run_detection(frame: np.ndarray, model: Florence2, confidence_threshold: float = 0.5):
+def run_detection(frame: np.ndarray, model: Florence2, confidence_threshold: float =0.99):
     """
     Performs object detection on the given frame using the Florence2 model.
     Attempts to pass the frame directly to model.predict if supported,
@@ -42,17 +71,11 @@ def run_detection(frame: np.ndarray, model: Florence2, confidence_threshold: flo
 
     detections_result = None
     try:
-        temp_image_path = "temp_frame_for_detection.jpg"
-        cv2.imwrite(temp_image_path, frame)
+        # Pass the frame directly to the model's predict method
+        # Assuming model.predict() can handle a NumPy array directly.
+        # If it expects a PIL Image or another format, further conversion might be needed here.
+        detections_result = model.predict(frame, confidence=confidence_threshold)
         
-        detections_result = model.predict(temp_image_path, confidence=confidence_threshold)
-        
-        if os.path.exists(temp_image_path):
-            try:
-                os.remove(temp_image_path)
-            except Exception as e:
-                print(f"Could not remove temporary file {temp_image_path}: {e}")
-
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -105,7 +128,7 @@ def draw_detections_on_frame(frame_to_draw_on: np.ndarray, detections_result: sv
         
         text = f"{label}: {conf:.2f}"
         text_y_pos = y_min - 10 if y_min - 10 > 10 else y_min + 15 
-        cv2.putText(frame_to_draw_on, text, (x_min, text_y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        #cv2.putText(frame_to_draw_on, text, (x_min, text_y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         target_center_x = (x_min + x_max) // 2
         target_center_y = (y_min + y_max) // 2
@@ -116,6 +139,57 @@ def draw_detections_on_frame(frame_to_draw_on: np.ndarray, detections_result: sv
     cv2.circle(frame_to_draw_on, (img_center_x, img_center_y), 5, (255, 0, 0), -1)
             
     return frame_to_draw_on
+
+def update_model_ontology(new_ontology_caption):
+    """
+    Reload the global model with new ontology.
+    
+    Args:
+        new_ontology_caption (dict): Dictionary mapping class names to captions
+        
+    Returns:
+        tuple: (success, model, device, ontology) - success is bool, others are the updated objects
+    """
+    global MODEL, ONTOLOGY, DEVICE
+    
+    try:
+        print(f"Attempting to update model ontology to: {list(new_ontology_caption.keys())}")
+        
+        # Create new ontology
+        new_ontology = CaptionOntology(new_ontology_caption)
+        
+        # Check if the model has an update method (this is speculative)
+        if hasattr(MODEL, 'update_ontology'):
+            print("Model supports ontology update, using update method...")
+            MODEL.update_ontology(new_ontology)
+            ONTOLOGY = new_ontology
+            print("Model ontology updated successfully.")
+            return True, MODEL, DEVICE, ONTOLOGY
+        elif hasattr(MODEL, 'ontology'):
+            print("Attempting to directly update model.ontology...")
+            MODEL.ontology = new_ontology
+            ONTOLOGY = new_ontology
+            print("Model ontology updated directly.")
+            return True, MODEL, DEVICE, ONTOLOGY
+        else:
+            # Fall back to recreating the model (but faster than full reinit)
+            print("Model doesn't support ontology update, recreating model...")
+            
+            # Clear GPU memory first
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Create new model with new ontology
+            ONTOLOGY = new_ontology
+            MODEL = Florence2(ontology=ONTOLOGY, model_id="D:/models")
+            print("Model recreated with new ontology.")
+            return True, MODEL, DEVICE, ONTOLOGY
+            
+    except Exception as e:
+        print(f"Error updating model ontology: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, MODEL, DEVICE, ONTOLOGY
 
 # Example usage (optional, for testing this module directly)
 if __name__ == "__main__":

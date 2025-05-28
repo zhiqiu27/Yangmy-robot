@@ -8,6 +8,7 @@ test_height_adjustment.py
 import sys
 import time
 import logging
+import math
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.go2.sport.sport_client import SportClient
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_ # For potential state display
@@ -99,6 +100,16 @@ def main():
                 
                 logger.info(f"调用 BodyHeight({relative_height:.3f}) ...")
                 ret = sport_client.BodyHeight(relative_height)
+                time.sleep(1)
+                # 只有在最低高度时才添加俯仰角
+                if relative_height == -0.18:
+                    # 添加一个小的俯仰角 (10度转换为弧度)
+                    pitch_degrees = 12.0
+                    pitch_radians = math.radians(pitch_degrees)
+                    logger.info(f"机身已调整到最低位置，添加俯仰角: {pitch_degrees}度 ({pitch_radians:.3f}弧度)")
+                    sport_client.Euler(0, pitch_radians, 0)
+                else:
+                    logger.info("机身高度不是最低位置，不添加俯仰角")
                 if ret == 0:
                     logger.info(f"BodyHeight({relative_height:.3f}) 调用成功！")
                     current_body_height_abs = DEFAULT_BODY_HEIGHT_ABS + relative_height

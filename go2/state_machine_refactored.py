@@ -68,7 +68,7 @@ class RobotStateMachine:
     def _init_pitch_controller(self):
         """初始化俯仰角控制器"""
         try:
-            self.pitch_controller = PitchController(self.sport_client, interpolation_duration_s=2.0)
+            self.pitch_controller = PitchController(self.sport_client, interpolation_duration_s=1.0)
             self.pitch_controller.start_control()
             self.logger.info("PitchController 初始化成功")
         except Exception as e:
@@ -243,10 +243,11 @@ class RobotStateMachine:
             
             # 恢复姿态
             self.control.restore_default_posture()
+            time.sleep(1)
             self._transition_to_state(State.SEND_NEXT_COMMAND)
         else:
             self.logger.warning("抓取失败")
-            self.control.restore_default_posture()
+            #self.control.restore_default_posture()
             self.state = State.DONE
     
     def _handle_send_next_command(self):
@@ -263,8 +264,8 @@ class RobotStateMachine:
         time.sleep(2.0)
         
         # 获取人员坐标
-        next_coord = self._get_next_target_from_vlm()
-        self.target_list[1]["coord"] = next_coord
+        #next_coord = self._get_next_target_from_vlm()
+        #self.target_list[1]["coord"] = next_coord
         
         # 询问是否需要方向命令
         if self._ask_for_direction_command():
@@ -281,7 +282,7 @@ class RobotStateMachine:
         
         # 使用像素对齐并接近到1.5m的方法
         try:
-            success = self.navigation.approach_person_to_distance(target_distance=0.8)
+            success = self.navigation.approach_person_to_distance(target_distance=0.40)
             if success:
                 self.logger.info("成功接近人员到1.5m距离")
                 self._transition_to_state(State.RELEASE_OBJECT)
@@ -295,12 +296,9 @@ class RobotStateMachine:
     def _handle_release_object(self):
         """处理释放物体状态"""
         self.logger.info("进入 RELEASE_OBJECT 状态")
-        self.sport_client.Sit()
-        time.sleep(3)
+
         self.control.release_object()
-        time.sleep(2)
-        self.sport_client.RiseSit()
-        time.sleep(2)
+
         self.logger.info("任务完成")
         self.state = State.DONE
 

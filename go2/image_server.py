@@ -25,8 +25,8 @@ logging.basicConfig(
 )
 
 # 全局常量
-CALIBRATION_SAMPLES = 5
-CALIBRATION_DELAY = 0.5  # Seconds
+CALIBRATION_SAMPLES = 2
+CALIBRATION_DELAY = 2  # Seconds
 HOST = 'localhost' # 对于同一台机器上的进程间通信，使用localhost
 PORT = 50001       # 确保这个端口未被其他应用占用
 

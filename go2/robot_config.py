@@ -78,7 +78,7 @@ CRAWL_VX = 0.015
 
 # 俯仰角参数
 DESIRED_PITCH_ANGLE = 20.0
-GRASP_PITCH_ANGLE = 12
+GRASP_PITCH_ANGLE = 10
 
 # 串口参数
 SERIAL_PORT = '/dev/wheeltec_mic'

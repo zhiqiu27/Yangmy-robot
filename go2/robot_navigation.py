@@ -92,7 +92,7 @@ class RobotNavigation:
         if avg_depth is None:
             logger.error("无法获取有效深度值")
             return False
-
+        time.sleep(1)
         # 阶段A：前进到确认深度
         if not self._stage_a_approach_to_depth(avg_depth):
             return False
@@ -338,7 +338,7 @@ class RobotNavigation:
             
             # 前进控制
             vx = APPROACH_VX
-            self.sport_client.Move(0.1, 0.0, vyaw)
+            self.sport_client.Move(0.12, 0.0, vyaw)
             print(f"阶段A - 前进速度: {vx:.3f}, 偏航速度: {vyaw:.3f}")
             time.sleep(NAVIGATION_CONTROL_PERIOD)
         
@@ -417,7 +417,7 @@ class RobotNavigation:
                     pid_output = self.dist_pid(current_depth_x)
                     vx = max(0.0, -pid_output)
                     if vx > 0.001:
-                        vx = max(0.01, vx)
+                        vx = max(0.1, vx)
                     vx = min(vx, self.dist_pid.output_limits[1])
                 else:
                     logger.warning("有边界框但无深度信息")

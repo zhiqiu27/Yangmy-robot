@@ -165,7 +165,7 @@ class RobotController:
         # Setpoint for yaw_pid_visual is 0 (target pixel error is 0)
 
         # 初始化 PitchController
-        self.pitch_controller = PitchController(self.sport_client, interpolation_duration_s=2.0)
+        self.pitch_controller = PitchController(self.sport_client, interpolation_duration_s=1.0)
         self.logger.info("PitchController initialized.")
         # 关键点：启动 PitchController 的后台线程
         try:
