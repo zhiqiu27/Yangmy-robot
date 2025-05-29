@@ -4,6 +4,7 @@ import numpy as np
 import json
 import logging
 import threading
+import pyzed.sl as sl
 
 # 尝试导入 PositionDetector，如果失败则记录错误但允许脚本尝试运行（如果仅用于测试网络部分）
 try:
@@ -275,6 +276,27 @@ class ImageProcessorServer:
 
             self._start_viewer_message_listener()
 
+            # 创建ZED相机对象
+            zed = sl.Camera()
+
+            # 设置初始化参数
+            init_params = sl.InitParameters()
+            init_params.camera_resolution = sl.RESOLUTION.HD720
+            init_params.camera_fps = 30
+
+            # 打开相机
+            err = zed.open(init_params)
+
+            # 设置流媒体参数
+            stream_params = sl.StreamingParameters()
+            stream_params.codec = sl.STREAMING_CODEC.H264  # 或 H265
+            stream_params.bitrate = 8000  # kbps
+            stream_params.port = 30000    # 流媒体端口
+
+            # 启用流媒体
+            err = zed.enable_streaming(stream_params)
+
+            # 开始流媒体传输
             while self.running:
                 try:
                     conn, addr = self.server_socket.accept()
@@ -291,7 +313,6 @@ class ImageProcessorServer:
                     if self.running:
                         self.logger.error(f"服务器主循环发生意外错误: {e}")
                     break
-
 
         except Exception as e:
             self.logger.critical(f"服务器未能启动或意外终止: {e}", exc_info=True)

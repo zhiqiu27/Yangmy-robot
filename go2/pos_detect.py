@@ -15,7 +15,6 @@ import socket
 import struct # For packing/unpacking data size
 import time   # For small delays
 import threading
-import queue
 import logging
 
 # Configure basic logging for the module
@@ -62,7 +61,6 @@ class PositionDetector:
         self.img_mat = sl.Mat()
         self.xyz_mat = sl.Mat()
 
-        self.image_queue = queue.Queue(maxsize=50)
         self.bbox_lock = threading.Lock()
         self.last_known_bbox_shared = {'bbox': None} # bbox will be (x1,y1,x2,y2) tuple
         
@@ -80,12 +78,11 @@ class PositionDetector:
         self.image_conn = None
         self.bbox_conn = None
         
-        self.image_sender_thread = None
         self.bbox_receiver_thread = None
         self.zed_processing_thread = None
 
-        self.image_sender_stop_event = threading.Event()
         self.bbox_receiver_stop_event = threading.Event()
+        
         logger.info("PositionDetector initialized.")
 
     def _open_camera(self):
@@ -189,36 +186,194 @@ class PositionDetector:
         finally:
             sock.settimeout(original_timeout) # Restore original timeout
 
-    def _image_sender_worker(self):
-        logger.info("Image sender worker started.")
-        temp_image_conn = self.image_conn # Use a local reference
-        while not self.image_sender_stop_event.is_set() and not self.stop_event.is_set():
-            try:
-                jpeg_size, frame_bytes = self.image_queue.get(timeout=0.1)
-            except queue.Empty:
+    def _run_zed_loop(self):
+        logger.info("ZED processing loop started.")
+        fps_reporting_interval = self.camera_fps * 2 # Report every 2 seconds approx
+        frame_count = 0
+        start_time_fps = time.time()
+
+        while not self.stop_event.is_set():
+            self._manage_connections()
+
+            if not self.image_conn:
+                time.sleep(0.1) # Wait if no image client to send to
                 continue
             
-            if temp_image_conn is None: 
-                logger.warning("Image sender: No connection. Stopping.")
-                break
-            try:
-                if not self._send_all(temp_image_conn, struct.pack('>I', jpeg_size)):
-                    logger.error("Image sender: Failed to send image size. Closing connection.")
-                    break
-                if jpeg_size > 0 and frame_bytes:
-                    if not self._send_all(temp_image_conn, frame_bytes):
-                        logger.error("Image sender: Failed to send image data. Closing connection.")
-                        break
-                self.image_queue.task_done()
-            except Exception as e:
-                logger.error(f"Image sender: Error: {e}. Exiting.")
-                break
+            if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
+                frame_process_start_time = time.time() # Start timing for frame processing
+
+                # Always get image for transmission
+                self.zed.retrieve_image(self.img_mat, sl.VIEW.LEFT)
+                
+                # Only process depth and bbox if bbox is available
+                current_bbox_local = None
+                with self.bbox_lock:
+                    current_bbox_local = self.last_known_bbox_shared['bbox']
+                
+                if current_bbox_local:
+                    # Only retrieve depth data when we have a bbox to process
+                    self.zed.retrieve_measure(self.xyz_mat, sl.MEASURE.XYZ)
+                    depth_coords = self._bbox_center_xyz(current_bbox_local, self.xyz_mat)
+                    if depth_coords:
+                        with self.latest_object_xy_lock:
+                            self.latest_object_xy_shared['xy'] = (depth_coords[0], depth_coords[1])
+                        pixel_center_x = (current_bbox_local[0] + current_bbox_local[2]) / 2.0
+                        img_width = self.img_mat.get_width()
+                        with self.latest_visual_info_lock:
+                            self.latest_visual_info_shared['pixel_cx'] = pixel_center_x
+                            self.latest_visual_info_shared['image_width'] = img_width
+                            self.latest_visual_info_shared['bbox_available'] = True
+                    else:
+                        with self.latest_object_xy_lock:
+                            self.latest_object_xy_shared['xy'] = None
+                        with self.latest_visual_info_lock:
+                            self.latest_visual_info_shared['bbox_available'] = False
+                            self.latest_visual_info_shared['pixel_cx'] = None
+                            self.latest_visual_info_shared['image_width'] = self.img_mat.get_width() if self.img_mat.is_init() else None
+                else:
+                    # No bbox - just clear the tracking data, don't process depth
+                    with self.latest_object_xy_lock:
+                        self.latest_object_xy_shared['xy'] = None
+                    with self.latest_visual_info_lock:
+                        self.latest_visual_info_shared['bbox_available'] = False
+                        self.latest_visual_info_shared['pixel_cx'] = None
+                        self.latest_visual_info_shared['image_width'] = self.img_mat.get_width() if self.img_mat.is_init() else None
+
+                # Image processing and direct transmission (like simple_zed_stream.py)
+                bgr_image_cpu = self.img_mat.get_data()
+                rgb_image_cpu = cv2.cvtColor(bgr_image_cpu, cv2.COLOR_BGRA2BGR)
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40]
+                result, frame_jpeg = cv2.imencode('.jpg', rgb_image_cpu, encode_param)
+
+                frame_process_duration = time.time() - frame_process_start_time
+
+                if frame_process_duration > self.max_frame_processing_time:
+                    logger.warning(f"Frame processing ({frame_process_duration:.3f}s) exceeded max time ({self.max_frame_processing_time}s). Skipping frame.")
+                elif result:
+                    # Direct send like simple_zed_stream.py
+                    try:
+                        image_size = len(frame_jpeg)
+                        if not self._send_all(self.image_conn, struct.pack('>I', image_size)):
+                            logger.warning("Failed to send image size, client may have disconnected.")
+                            try: self.image_conn.close()
+                            except: pass
+                            self.image_conn = None
+                            continue
+                        if image_size > 0:
+                            if not self._send_all(self.image_conn, frame_jpeg.tobytes()):
+                                logger.warning("Failed to send image data, client may have disconnected.")
+                                try: self.image_conn.close()
+                                except: pass
+                                self.image_conn = None
+                                continue
+                    except Exception as e:
+                        logger.error(f"Error sending image: {e}")
+                        try: self.image_conn.close()
+                        except: pass
+                        self.image_conn = None
+                        continue
+                elif not result:
+                    logger.error("JPEG encoding failed.")
+                
+                frame_count += 1
+                if frame_count >= fps_reporting_interval:
+                    elapsed_time = time.time() - start_time_fps
+                    if elapsed_time > 0:
+                        fps = frame_count / elapsed_time
+                        logger.debug(f"ZED loop frame production rate: {fps:.2f} FPS")
+                    frame_count = 0
+                    start_time_fps = time.time()
+            else:
+                # logger.warning("ZED grab failed.") # Can be too verbose if temporary
+                time.sleep(0.01) # Brief pause if grab fails
         
-        logger.info("Image sender worker finished.")
-        if temp_image_conn:
-            try: temp_image_conn.close()
-            except Exception as e_close: logger.debug(f"Exception closing image_conn in sender: {e_close}")
-        # No need to set self.image_conn to None here, main loop handles that
+        logger.info("ZED processing loop finished.")
+
+    def start(self):
+        logger.info("Starting PositionDetector...")
+        try:
+            self._open_camera()
+            self._setup_sockets()
+            
+            self.stop_event.clear() # Ensure stop event is clear before starting threads
+            self.bbox_receiver_stop_event.clear()
+
+            # The ZED processing loop (which includes connection management) runs in its own thread
+            self.zed_processing_thread = threading.Thread(target=self._run_zed_loop, name="ZEDLoopThread")
+            self.zed_processing_thread.daemon = True
+            self.zed_processing_thread.start()
+            logger.info("PositionDetector started successfully. ZED loop and server setups initiated.")
+        except Exception as e:
+            logger.error(f"Failed to start PositionDetector: {e}", exc_info=True)
+            self.shutdown() # Attempt to clean up if start fails
+            raise # Re-raise the exception
+
+    def get_current_object_xy(self):
+        """Returns the latest calculated (X, Y) coordinates of the object or None."""
+        with self.latest_object_xy_lock:
+            xy = self.latest_object_xy_shared['xy']
+        # logger.debug(f"get_current_object_xy returning: {xy}") # For debugging if needed
+        return xy
+
+    def get_current_visual_info(self):
+        """Returns the latest calculated (pixel_cx, image_width, bbox_available) or None for values if not available."""
+        with self.latest_visual_info_lock:
+            info = self.latest_visual_info_shared.copy() # Return a copy
+        # logger.debug(f"get_current_visual_info returning: {info}")
+        return info
+
+    def shutdown(self):
+        logger.info("Shutting down PositionDetector...")
+        self.stop_event.set() # Signal all loops and threads to stop
+
+        # Signal individual worker threads to stop as well
+        self.bbox_receiver_stop_event.set()
+
+        threads_to_join = []
+        if self.zed_processing_thread and self.zed_processing_thread.is_alive():
+            threads_to_join.append(self.zed_processing_thread)
+        # The receiver thread is joined by _manage_connections or implicitly when its conn is None
+        # However, if it was started and _manage_connections isn't running due to shutdown,
+        # or if it is stuck, explicitly joining it here is safer.
+        if self.bbox_receiver_thread and self.bbox_receiver_thread.is_alive():
+             # logger.debug("Attempting to join bbox receiver thread from shutdown...")
+             threads_to_join.append(self.bbox_receiver_thread)
+
+        for thread in threads_to_join:
+            try:
+                logger.info(f"Joining thread: {thread.name}")
+                thread.join(timeout=1.0) # Increased timeout slightly
+                if thread.is_alive():
+                    logger.warning(f"Thread {thread.name} did not terminate in time.")
+            except Exception as e:
+                logger.error(f"Error joining thread {thread.name}: {e}")
+        
+        # Close client connections
+        if self.image_conn:
+            try: self.image_conn.close()
+            except Exception as e: logger.debug(f"Exception closing image_conn: {e}")
+            self.image_conn = None
+        if self.bbox_conn:
+            try: self.bbox_conn.close()
+            except Exception as e: logger.debug(f"Exception closing bbox_conn: {e}")
+            self.bbox_conn = None
+        
+        # Close server sockets
+        if self.image_server_socket:
+            try: self.image_server_socket.close()
+            except Exception as e: logger.debug(f"Exception closing image_server_socket: {e}")
+            self.image_server_socket = None
+        if self.bbox_server_socket:
+            try: self.bbox_server_socket.close()
+            except Exception as e: logger.debug(f"Exception closing bbox_server_socket: {e}")
+            self.bbox_server_socket = None
+        
+        if self.zed and self.zed.is_opened():
+            logger.info("Closing ZED camera...")
+            self.zed.close()
+            logger.info("ZED camera closed.")
+        
+        logger.info("PositionDetector shutdown complete.")
 
     def _bbox_receiver_worker(self):
         logger.info("Bbox receiver worker started.")
@@ -288,25 +443,12 @@ class PositionDetector:
 
     def _manage_connections(self):
         # --- Manage Image Client Connection ---
-        if self.image_conn is None or (self.image_sender_thread and not self.image_sender_thread.is_alive()):
-            if self.image_sender_thread and not self.image_sender_thread.is_alive():
-                logger.warning("Image sender thread died or finished. Attempting to re-establish...")
-                self.image_sender_stop_event.set() # Ensure it's told to stop if stuck
-                if self.image_sender_thread.is_alive(): self.image_sender_thread.join(timeout=0.5)
-            if self.image_conn:
-                try: self.image_conn.close()
-                except Exception: pass
-                self.image_conn = None
-            
+        if self.image_conn is None:
             logger.info("Waiting for IMAGE client connection...")
             self.image_server_socket.settimeout(1.0) # Timeout for accept
             try:
                 self.image_conn, img_addr = self.image_server_socket.accept()
                 logger.info(f"IMAGE client connected from {img_addr}")
-                self.image_sender_stop_event.clear() # Clear before starting new thread
-                self.image_sender_thread = threading.Thread(target=self._image_sender_worker, name="ImageSenderThread")
-                self.image_sender_thread.daemon = True
-                self.image_sender_thread.start()
             except socket.timeout:
                 pass # Will retry in the next loop iteration
             except Exception as e:
@@ -338,200 +480,6 @@ class PositionDetector:
             except Exception as e:
                 logger.error(f"Error accepting BBOX client: {e}")
                 time.sleep(0.5)
-
-    def _run_zed_loop(self):
-        logger.info("ZED processing loop started.")
-        fps_reporting_interval = self.camera_fps * 2 # Report every 2 seconds approx
-        frame_count = 0
-        start_time_fps = time.time()
-
-        while not self.stop_event.is_set():
-            self._manage_connections()
-
-            if not (self.image_conn and self.image_sender_thread and self.image_sender_thread.is_alive()):
-                time.sleep(0.1) # Wait if no image client to send to, or thread not running
-                continue
-
-            if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
-                frame_process_start_time = time.time() # Start timing for frame processing
-
-                self.zed.retrieve_image(self.img_mat, sl.VIEW.LEFT)
-                self.zed.retrieve_measure(self.xyz_mat, sl.MEASURE.XYZ)
-
-                current_bbox_local = None
-                with self.bbox_lock:
-                    current_bbox_local = self.last_known_bbox_shared['bbox']
-                
-                if current_bbox_local:
-                    depth_coords = self._bbox_center_xyz(current_bbox_local, self.xyz_mat)
-                    if depth_coords:
-                        # logger.info(f"Depth coordinates: {depth_coords}") # Logged if needed for debug
-                        with self.latest_object_xy_lock:
-                            self.latest_object_xy_shared['xy'] = (depth_coords[0], depth_coords[1])
-                        # New: Store pixel cx and image width if bbox was processed
-                        pixel_center_x = (current_bbox_local[0] + current_bbox_local[2]) / 2.0
-                        img_width = self.img_mat.get_width() # Get current image width
-                        with self.latest_visual_info_lock:
-                            self.latest_visual_info_shared['pixel_cx'] = pixel_center_x
-                            self.latest_visual_info_shared['image_width'] = img_width
-                            self.latest_visual_info_shared['bbox_available'] = True
-                    else: # No valid depth, clear stored XY and visual info if it relied on this bbox
-                        with self.latest_object_xy_lock:
-                            self.latest_object_xy_shared['xy'] = None
-                        with self.latest_visual_info_lock:
-                            self.latest_visual_info_shared['bbox_available'] = False
-                            self.latest_visual_info_shared['pixel_cx'] = None 
-                            # image_width could be kept if img_mat is valid, but None if dependent on bbox success
-                            # For simplicity, let's clear it too, or keep last valid one?
-                            # Let's keep it if available from self.img_mat if we assume img_mat is always fresh.
-                            if self.img_mat and self.img_mat.is_init():
-                                self.latest_visual_info_shared['image_width'] = self.img_mat.get_width()
-                            else:
-                                self.latest_visual_info_shared['image_width'] = None
-                else: # No bbox, clear stored XY and visual info
-                    with self.latest_object_xy_lock:
-                        self.latest_object_xy_shared['xy'] = None
-                    with self.latest_visual_info_lock:
-                        self.latest_visual_info_shared['bbox_available'] = False
-                        self.latest_visual_info_shared['pixel_cx'] = None
-                        # Keep image_width if img_mat is valid
-                        if self.img_mat and self.img_mat.is_init():
-                             self.latest_visual_info_shared['image_width'] = self.img_mat.get_width()
-                        else:
-                            self.latest_visual_info_shared['image_width'] = None
-
-
-                bgr_image_cpu = self.img_mat.get_data()
-                rgb_image_cpu = cv2.cvtColor(bgr_image_cpu, cv2.COLOR_BGRA2BGR)
-                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 40] # Quality 40 for less bandwidth
-                result, frame_jpeg = cv2.imencode('.jpg', rgb_image_cpu, encode_param)
-
-                frame_process_duration = time.time() - frame_process_start_time
-
-                if frame_process_duration > self.max_frame_processing_time:
-                    logger.warning(f"Frame processing ({frame_process_duration:.3f}s) exceeded max time ({self.max_frame_processing_time}s). Skipping frame.")
-                elif result:
-                    try:
-                        self.image_queue.put_nowait((len(frame_jpeg), frame_jpeg.tobytes()))
-                    except queue.Full:
-                        try:
-                            self.image_queue.get_nowait() # Clear one old item
-                            self.image_queue.put_nowait((len(frame_jpeg), frame_jpeg.tobytes()))
-                        except queue.Empty:
-                            pass
-                        except queue.Full:
-                            logger.warning("IMAGE_QUEUE still full after clearing one item, frame dropped.")
-                elif not result: # Explicitly check for result being False if not skipped
-                    logger.error("JPEG encoding failed.")
-                    try:
-                        self.image_queue.put_nowait((0, b'')) # Signal encoding error
-                    except queue.Full:
-                         logger.warning("IMAGE_QUEUE full, failed to send JPEG encoding error signal.")
-                
-                frame_count += 1
-                if frame_count >= fps_reporting_interval:
-                    elapsed_time = time.time() - start_time_fps
-                    if elapsed_time > 0:
-                        fps = frame_count / elapsed_time
-                        logger.debug(f"ZED loop frame production rate: {fps:.2f} FPS (to IMAGE_QUEUE)")
-                    frame_count = 0
-                    start_time_fps = time.time()
-            else:
-                # logger.warning("ZED grab failed.") # Can be too verbose if temporary
-                time.sleep(0.01) # Brief pause if grab fails
-        
-        logger.info("ZED processing loop finished.")
-
-    def start(self):
-        logger.info("Starting PositionDetector...")
-        try:
-            self._open_camera()
-            self._setup_sockets()
-            
-            self.stop_event.clear() # Ensure stop event is clear before starting threads
-            self.image_sender_stop_event.clear()
-            self.bbox_receiver_stop_event.clear()
-
-            # The ZED processing loop (which includes connection management) runs in its own thread
-            self.zed_processing_thread = threading.Thread(target=self._run_zed_loop, name="ZEDLoopThread")
-            self.zed_processing_thread.daemon = True
-            self.zed_processing_thread.start()
-            logger.info("PositionDetector started successfully. ZED loop and server setups initiated.")
-        except Exception as e:
-            logger.error(f"Failed to start PositionDetector: {e}", exc_info=True)
-            self.shutdown() # Attempt to clean up if start fails
-            raise # Re-raise the exception
-
-    def get_current_object_xy(self):
-        """Returns the latest calculated (X, Y) coordinates of the object or None."""
-        with self.latest_object_xy_lock:
-            xy = self.latest_object_xy_shared['xy']
-        # logger.debug(f"get_current_object_xy returning: {xy}") # For debugging if needed
-        return xy
-
-    def get_current_visual_info(self):
-        """Returns the latest calculated (pixel_cx, image_width, bbox_available) or None for values if not available."""
-        with self.latest_visual_info_lock:
-            info = self.latest_visual_info_shared.copy() # Return a copy
-        # logger.debug(f"get_current_visual_info returning: {info}")
-        return info
-
-    def shutdown(self):
-        logger.info("Shutting down PositionDetector...")
-        self.stop_event.set() # Signal all loops and threads to stop
-
-        # Signal individual worker threads to stop as well
-        self.image_sender_stop_event.set()
-        self.bbox_receiver_stop_event.set()
-
-        threads_to_join = []
-        if self.zed_processing_thread and self.zed_processing_thread.is_alive():
-            threads_to_join.append(self.zed_processing_thread)
-        # The sender/receiver threads are joined by _manage_connections or implicitly when their conn is None
-        # However, if they were started and _manage_connections isn't running due to shutdown,
-        # or if they are stuck, explicitly joining them here is safer.
-        if self.image_sender_thread and self.image_sender_thread.is_alive():
-             # logger.debug("Attempting to join image sender thread from shutdown...")
-             threads_to_join.append(self.image_sender_thread)
-        if self.bbox_receiver_thread and self.bbox_receiver_thread.is_alive():
-             # logger.debug("Attempting to join bbox receiver thread from shutdown...")
-             threads_to_join.append(self.bbox_receiver_thread)
-
-        for thread in threads_to_join:
-            try:
-                logger.info(f"Joining thread: {thread.name}")
-                thread.join(timeout=1.0) # Increased timeout slightly
-                if thread.is_alive():
-                    logger.warning(f"Thread {thread.name} did not terminate in time.")
-            except Exception as e:
-                logger.error(f"Error joining thread {thread.name}: {e}")
-        
-        # Close client connections
-        if self.image_conn:
-            try: self.image_conn.close()
-            except Exception as e: logger.debug(f"Exception closing image_conn: {e}")
-            self.image_conn = None
-        if self.bbox_conn:
-            try: self.bbox_conn.close()
-            except Exception as e: logger.debug(f"Exception closing bbox_conn: {e}")
-            self.bbox_conn = None
-        
-        # Close server sockets
-        if self.image_server_socket:
-            try: self.image_server_socket.close()
-            except Exception as e: logger.debug(f"Exception closing image_server_socket: {e}")
-            self.image_server_socket = None
-        if self.bbox_server_socket:
-            try: self.bbox_server_socket.close()
-            except Exception as e: logger.debug(f"Exception closing bbox_server_socket: {e}")
-            self.bbox_server_socket = None
-        
-        if self.zed and self.zed.is_opened():
-            logger.info("Closing ZED camera...")
-            self.zed.close()
-            logger.info("ZED camera closed.")
-        
-        logger.info("PositionDetector shutdown complete.")
 
 # Main execution block for running pos_detect.py standalone
 if __name__ == "__main__":
