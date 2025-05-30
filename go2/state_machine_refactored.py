@@ -254,7 +254,17 @@ class RobotStateMachine:
         """处理发送下一个命令状态"""
         self.logger.info("进入 SEND_NEXT_COMMAND 状态")
         
-        # 发送NEXT_TARGET命令到PC端
+        # 直接等待接收方向命令
+        self.logger.info("等待接收方向命令...")
+        direction = self.communication.receive_direction_command()
+        if direction:
+            from robot_state import robot_state
+            self.control.execute_direction_rotation(direction, robot_state)
+            self.logger.info("方向转向完成")
+        else:
+            self.logger.warning("未接收到方向命令")
+        
+        # 转向结束后发送NEXT_TARGET命令到PC端
         if not self._send_next_to_vlm():
             self.logger.error("发送NEXT_TARGET命令失败，任务终止")
             self.state = State.DONE
@@ -262,17 +272,6 @@ class RobotStateMachine:
         
         # 等待PC端处理完成（可选的延迟）
         time.sleep(2.0)
-        
-        # 获取人员坐标
-        #next_coord = self._get_next_target_from_vlm()
-        #self.target_list[1]["coord"] = next_coord
-        
-        # 询问是否需要方向命令
-        if self._ask_for_direction_command():
-            direction = self.communication.receive_direction_command()
-            if direction:
-                from robot_state import robot_state
-                self.control.execute_direction_rotation(direction, robot_state)
         
         self._transition_to_state(State.NAVIGATE_TO_PERSON)
     
@@ -352,16 +351,6 @@ class RobotStateMachine:
             if user_input.lower() == 'ok':
                 break
             self.logger.info("输入无效，请输入 'ok'")
-    
-    def _ask_for_direction_command(self):
-        """询问是否需要方向命令"""
-        while True:
-            choice = input("是否需要等待接收方向命令？(y/n): ")
-            if choice.lower() in ['y', 'yes']:
-                return True
-            elif choice.lower() in ['n', 'no']:
-                return False
-            self.logger.info("输入无效，请输入 y/n")
     
     def _send_next_to_vlm(self):
         """发送NEXT_TARGET命令到PC端"""

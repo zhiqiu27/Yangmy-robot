@@ -21,18 +21,22 @@ logger = logging.getLogger(__name__)
 BBOX_PORT = 12346
 COMMAND_PORT = 50001
 ZED_POINTCLOUD_PORT = 12350
+DIRECTION_MESSAGE_PORT = 12348  # 接收PC端方向命令的端口
 
 class BboxProcessor:
     def __init__(self, bbox_port=BBOX_PORT, command_port=COMMAND_PORT, 
-                 zed_host='localhost', zed_pointcloud_port=ZED_POINTCLOUD_PORT):
+                 zed_host='localhost', zed_pointcloud_port=ZED_POINTCLOUD_PORT,
+                 direction_port=DIRECTION_MESSAGE_PORT):
         self.bbox_port = bbox_port
         self.command_port = command_port
+        self.direction_port = direction_port
         self.zed_host = zed_host
         self.zed_pointcloud_port = zed_pointcloud_port
         
         # 服务器socket
         self.bbox_server_socket = None
         self.command_server_socket = None
+        self.direction_server_socket = None
         
         # 控制标志
         self.stop_event = threading.Event()
@@ -58,6 +62,13 @@ class BboxProcessor:
         self.command_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.command_server_socket.bind(('0.0.0.0', self.command_port))
         self.command_server_socket.listen(5)
+        
+        # 方向服务器
+        logger.info(f"设置方向服务器，端口: {self.direction_port}")
+        self.direction_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.direction_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.direction_server_socket.bind(('0.0.0.0', self.direction_port))
+        self.direction_server_socket.listen(5)
         
         logger.info("Bbox处理器服务器设置完成")
 
@@ -141,7 +152,7 @@ class BboxProcessor:
                     "timestamp": pointcloud_response.get('timestamp')
                 }
                 
-                logger.info(f"Bbox处理成功: {bbox} -> {xyz_coords}")
+                #logger.info(f"Bbox处理成功: {bbox} -> {xyz_coords}")
                 
             else:
                 # 点云获取失败
@@ -207,6 +218,8 @@ class BboxProcessor:
                 response = self._get_latest_detection()
             elif command == 'reset':
                 response = self._reset_state()
+            elif command == 'next_target':
+                response = self._handle_next_target()
             else:
                 response = {
                     "status": "error",
@@ -271,6 +284,121 @@ class BboxProcessor:
             "message": "State reset successfully"
         }
 
+    def _handle_next_target(self) -> Dict[str, Any]:
+        """处理next_target命令 - 通知切换到下一个检测目标"""
+        logger.info("收到next_target命令，准备切换检测目标")
+        
+        # 清除当前检测状态，为新目标做准备
+        with self.bbox_lock:
+            self.latest_bbox = None
+            self.latest_xyz_coords = None
+        
+        logger.info("已清除当前检测状态，等待新目标")
+        
+        # 向远端服务器发送NEXT_TARGET命令
+        success = self._send_next_target_to_remote()
+        
+        if success:
+            return {
+                "status": "success",
+                "message": "Target switched successfully and remote server notified",
+                "timestamp": time.time()
+            }
+        else:
+            return {
+                "status": "partial_success",
+                "message": "Target switched locally but failed to notify remote server",
+                "timestamp": time.time()
+            }
+    
+    def _send_next_target_to_remote(self) -> bool:
+        """向远端服务器发送NEXT_TARGET命令"""
+        # 使用与image_server.py相同的配置
+        remote_host = "192.168.3.70"  # VIEWER_PC1_IP
+        remote_port = 12347           # VIEWER_ORDER_PORT
+        
+        try:
+            logger.info(f"向远端服务器发送NEXT_TARGET命令: {remote_host}:{remote_port}")
+            
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5)  # 5秒超时
+                s.connect((remote_host, remote_port))
+                
+                # 发送纯文本字符串 "NEXT_TARGET"
+                s.sendall(b"NEXT_TARGET")
+                logger.info("已成功发送NEXT_TARGET命令到远端服务器")
+                
+                return True
+                
+        except Exception as e:
+            logger.error(f"向远端服务器发送NEXT_TARGET命令失败: {e}")
+            return False
+
+    def _direction_server_thread(self):
+        """方向命令服务线程"""
+        logger.info("方向命令服务线程启动")
+        
+        while not self.stop_event.is_set():
+            try:
+                # 等待方向命令客户端连接
+                conn, addr = self.direction_server_socket.accept()
+                logger.debug(f"方向命令客户端连接: {addr}")
+                
+                # 处理方向命令请求
+                self._handle_direction_request(conn, addr)
+                
+            except Exception as e:
+                if not self.stop_event.is_set():
+                    logger.error(f"方向命令服务错误: {e}")
+                    time.sleep(0.1)
+        
+        logger.info("方向命令服务线程结束")
+
+    def _handle_direction_request(self, conn, addr):
+        """处理方向命令请求"""
+        logger.info(f"方向命令连接来自 {addr}")
+        try:
+            data = conn.recv(1024)
+            if data:
+                direction = data.decode('utf-8').strip()
+                logger.info(f"收到方向命令: '{direction}'")
+                
+                # 有效方向列表
+                valid_directions = [
+                    "forward", "backward", "left", "right",
+                    "front-left", "front-right", "back-left", "back-right"
+                ]
+                
+                if direction in valid_directions:
+                    logger.info(f"处理方向命令: {direction}")
+                    # 转发方向命令到机器人端口50002
+                    success = self._forward_direction_to_robot(direction)
+                    if success:
+                        conn.sendall(f"ACK: Direction {direction} received and processed".encode('utf-8'))
+                    else:
+                        conn.sendall(f"ERROR: Failed to forward direction {direction}".encode('utf-8'))
+                else:
+                    logger.warning(f"无效方向命令: {direction}")
+                    conn.sendall(f"ERROR: Invalid direction {direction}".encode('utf-8'))
+        except Exception as e:
+            logger.error(f"处理方向命令时出错 {addr}: {e}")
+        finally:
+            conn.close()
+
+    def _forward_direction_to_robot(self, direction):
+        """转发方向命令到机器人端口50002"""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                s.connect(('localhost', 50002))
+                s.sendall(direction.encode('utf-8'))
+                response = s.recv(1024)
+                logger.info(f"方向命令 '{direction}' 已转发到机器人，响应: {response.decode()}")
+                return True
+        except Exception as e:
+            logger.error(f"转发方向命令 '{direction}' 到机器人失败: {e}")
+            return False
+
     def start(self):
         """启动Bbox处理器"""
         logger.info("启动Bbox处理器...")
@@ -281,7 +409,8 @@ class BboxProcessor:
             # 启动各个线程
             threads_config = [
                 ("BboxServer", self._bbox_server_thread),
-                ("CommandServer", self._command_server_thread)
+                ("CommandServer", self._command_server_thread),
+                ("DirectionServer", self._direction_server_thread)
             ]
             
             for name, target in threads_config:
@@ -294,6 +423,7 @@ class BboxProcessor:
             logger.info("Bbox处理器启动完成")
             logger.info(f"Bbox服务端口: {self.bbox_port}")
             logger.info(f"命令服务端口: {self.command_port}")
+            logger.info(f"方向命令服务端口: {self.direction_port}")
             logger.info(f"ZED点云服务: {self.zed_host}:{self.zed_pointcloud_port}")
             
             # 主线程保持运行
@@ -327,6 +457,9 @@ class BboxProcessor:
             except: pass
         if self.command_server_socket:
             try: self.command_server_socket.close()
+            except: pass
+        if self.direction_server_socket:
+            try: self.direction_server_socket.close()
             except: pass
         
         logger.info("Bbox处理器已关闭")
